@@ -64,6 +64,14 @@ func (a *Analyzer) Analyze(ctx context.Context, in Input) (ChangeContext, llm.Us
 		return ChangeContext{}, usage, fmt.Errorf("调用全局理解模型: %w", err)
 	}
 	text := strings.TrimSpace(content)
+	// 别除推理模型思考块（兼容 MiniMax-M3 等输出 <think>...</think> 后续接 JSON 的场景）。
+	// 若 think 块未被 </think> 闭合（MiniMax 响应被 length 截断或输出异常），保留原始文本，
+	// 让后面的 { ... } 提取与 JSON 解析有机会在 reply 块中匹配，避免变成空串误报 "unexpected end of JSON input"。
+	if i := strings.Index(text, "<think>"); i >= 0 {
+		if j := strings.Index(text[i:], "</think>"); j >= 0 {
+			text = strings.TrimSpace(text[:i] + text[i+j+len("</think>"):])
+		}
+	}
 	if i := strings.Index(text, "{"); i >= 0 {
 		if j := strings.LastIndex(text, "}"); j > i {
 			text = text[i : j+1]
@@ -71,7 +79,15 @@ func (a *Analyzer) Analyze(ctx context.Context, in Input) (ChangeContext, llm.Us
 	}
 	var out ChangeContext
 	if err := json.Unmarshal([]byte(text), &out); err != nil {
-		return ChangeContext{}, usage, fmt.Errorf("解析全局理解模型输出: %w", err)
+		return ChangeContext{}, usage, fmt.Errorf("解析全局理解模型输出: %w (raw 头 200 字=%s)", err, truncateForLog(content, 200))
 	}
 	return out, usage, nil
+}
+
+// truncateForLog 限制日志附加内容的长度，避免刷屏。
+func truncateForLog(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "...[truncated]"
 }

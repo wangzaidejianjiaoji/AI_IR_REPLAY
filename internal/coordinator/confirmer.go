@@ -167,6 +167,14 @@ func (c *Confirmer) confirmBatch(ctx context.Context, in ConfirmationInput, inpu
 		} `json:"decisions"`
 	}
 	content = strings.TrimSpace(content)
+	// 别除推理模型思考块（兼容 MiniMax-M3 等输出 <think>...</think> 后续接 JSON 的场景）
+	if i := strings.Index(content, "<think>"); i >= 0 {
+		if j := strings.Index(content[i:], "</think>"); j >= 0 {
+			content = strings.TrimSpace(content[:i] + content[i+j+len("</think>"):])
+		} else {
+			content = strings.TrimSpace(content[:i])
+		}
+	}
 	if i := strings.Index(content, "{"); i >= 0 {
 		if j := strings.LastIndex(content, "}"); j > i {
 			content = content[i : j+1]

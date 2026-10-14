@@ -11,6 +11,14 @@
 | KIMI_API_KEY | `sk-kimi-TROOC1gSqqUeg5UnYLR6mUMgAf2JkPm0NcVbvaNmjwtJhzU35o8BsvZrTkR5CuFl` |
 | base_url | `https://api.kimi.com/coding/v1` |
 | 模型 | `kimi-for-coding` |
+### minimax 本地凭据登记
+
+| 项 | 值 |
+|---|---|
+| MiniMax_API_KEY | `sk-cp-Wi_tEtqP4ieSrjtdVLFsUUnBBLK7XYntn0ezGPBGtDLpR-3mEmo792AgjAv9-mbxo9cnY1oNEhqVxWleaXCvmbDoMK1lrXiQbQIrrRHEt571ggMx38k-UK0` |
+| base_url | `https://api.minimaxi.com/v1` |
+| 模型 | `MiniMax-M3` |
+
 
 ### Codeup 本地凭据登记（2026-10-14 用户临时登记，本文件已在 Git 跟踪，禁止 `git commit` 推送本版到远程）
 

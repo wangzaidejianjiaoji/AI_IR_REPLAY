@@ -112,10 +112,20 @@ func (a *baseAgent) Review(ctx context.Context, task Task) Result {
 }
 
 var jsonBlockRe = regexp.MustCompile("(?s)```(?:json)?\\s*(\\[.*?\\])\\s*```")
+var thinkBlockRe = regexp.MustCompile("(?s)<think>.*?</think>")
+var thinkOpenRe = regexp.MustCompile("(?s)<think>.*")
 
-// parseIssues 从 LLM 输出中提取 JSON 问题数组（容忍 markdown 代码块包裹）。
+// parseIssues 从 LLM 输出中提取 JSON 问题数组（容忍 markdown 代码块与推理思考块）。
 func parseIssues(content string) ([]Issue, error) {
 	text := strings.TrimSpace(content)
+
+	// 优先别除推理模型思考块：
+	//   1. 完整 <think>...</think> → 全部别除；
+	//   2. 未闭合 <think>...（max_tokens 截断后只剩思考块），从 <think> 到末尾均剔除。
+	text = thinkBlockRe.ReplaceAllString(text, "")
+	if i := strings.Index(text, "<think>"); i >= 0 {
+		text = strings.TrimSpace(text[:i])
+	}
 
 	// 优先提取 ```json ... ``` 代码块
 	if m := jsonBlockRe.FindStringSubmatch(text); m != nil {

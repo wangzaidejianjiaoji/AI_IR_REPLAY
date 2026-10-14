@@ -56,6 +56,16 @@ llm:
     max_attempts: 3
     base_delay: "2s"
     max_delay: "30s"
+  
+  # 备用模型配置（当 kimi 限额时自动切换到 minimax）
+  fallback:
+    enabled: true
+    api_key: "${MiniMax_API_KEY}"
+    base_url: "https://api.minimaxi.com/v1"
+    models:
+      small: "MiniMax-M3"
+      medium: "MiniMax-M3"
+      large: "MiniMax-M3"
 
 agents:
   architect:   { enabled: true, priority: 1 }

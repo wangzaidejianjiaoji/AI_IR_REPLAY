@@ -120,6 +120,16 @@ type LLMConfig struct {
 		BaseDelay   string `yaml:"base_delay"`
 		MaxDelay    string `yaml:"max_delay"`
 	} `yaml:"retry"`
+	// Fallback 备用 LLM 配置，当主模型限额时自动切换
+	Fallback *FallbackConfig `yaml:"fallback"`
+}
+
+// FallbackConfig 备用模型配置。
+type FallbackConfig struct {
+	Enabled bool              `yaml:"enabled"` // 是否启用备用模型
+	APIKey  string            `yaml:"api_key"` // 备用模型 API Key
+	BaseURL string            `yaml:"base_url"` // 备用模型 Base URL
+	Models  map[string]string `yaml:"models"`  // 备用模型分级配置
 }
 
 type ModelPrice struct {

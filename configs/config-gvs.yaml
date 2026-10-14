@@ -26,9 +26,9 @@ codeup:
       name: "lzvsg/gvs"
       base_branch: "main"                  # 基准分支（MR diff 目标分支）
       branch_filter:
-        include: []                        # 为空表示不限制源分支
-        exclude:
-          - "release/*"
+        include:
+          - "ws100-1012"                  # 【临时】仅允许 ws100-1012 通过过滤（分支 + MR 源共用）
+        exclude: []
 
   per_page: 100
   state_path: "./data/gvs-branch-state.json"  # gvs 独立基线存储（与 gvs_infer 互不干扰）
@@ -55,6 +55,16 @@ llm:
     max_attempts: 3
     base_delay: "2s"
     max_delay: "30s"
+
+  # 备用模型配置（当 kimi 限额时自动切换到 minimax）
+  fallback:
+    enabled: true
+    api_key: "${MiniMax_API_KEY}"
+    base_url: "https://api.minimaxi.com/v1"
+    models:
+      small: "MiniMax-M3"
+      medium: "MiniMax-M3"
+      large: "MiniMax-M3"
 
 agents:
   architect:   { enabled: true, priority: 1 }
