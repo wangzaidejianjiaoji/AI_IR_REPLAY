@@ -59,7 +59,7 @@ Load 拒绝未知 YAML 字段和多个 YAML 文档；ValidateRuntime 在本地 d
 & '.\.gotmp\go1.23.12\go\bin\go.exe' run ./cmd/agent -config configs/config-pilot.yaml -once -dry-run
 ```
 
-dry-run 只阻止评论。Codeup 正常审查及无文件路径仍推进基线，GitHub 不生成评论去重标记可能反复收费。review_first_push=false 首次只记基线，不能把“没有报告”直接判为故障。MR 版本变化会拒绝发布，等待下轮即可，不能将旧报告标成新版本。
+dry-run 只阻止评论。Codeup 正常审查及无文件路径仍推进基线；GitHub 正常完成后在本进程内按 SHA 去重，但重启后没有平台评论标记仍可能重复审核收费。review_first_push=false 首次只记基线，不能把“没有报告”直接判为故障。MR 版本变化会拒绝发布，等待下轮即可，不能将旧报告标成新版本。
 
 ## 5. 容器部署说明
 
@@ -84,7 +84,7 @@ docker compose logs --tail 100 pr-agent
 | GET /health | 200，status=ok | 仅 liveness，不测仓库、模型或轮次 |
 | POST /trigger，无配置令牌 | 503 | 手动触发禁用 |
 | POST /trigger，错误/缺 Bearer | 401 | 不应触发 |
-| POST /trigger，正确 Bearer | 202 | 忙时可跳过，时间窗口可跳过，需日志确认 |
+| POST /trigger，正确 Bearer | 202 | 发起扫描轮次；待审核/审核中任务去重，时间窗口可跳过，需日志确认 |
 
 以下触发会启动真实轮次，只在已准备好的试点环境执行；令牌来自环境，不写字面值：
 

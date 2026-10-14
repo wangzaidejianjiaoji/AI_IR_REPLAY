@@ -1,5 +1,5 @@
 // Package scheduler 实现定时轮询调度：time.Ticker + 随机 jitter，
-// 支持外部手动触发，并在已有审核任务运行时跳过新的触发。
+// 支持外部手动触发。扫描轮次可重叠，单个审核任务由审查服务去重。
 package scheduler
 
 import (
@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"math/rand"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -17,7 +16,6 @@ type Scheduler struct {
 	jitter   time.Duration
 	trigger  chan struct{}
 	logger   *slog.Logger
-	running  atomic.Bool
 	wg       sync.WaitGroup
 }
 
@@ -33,10 +31,6 @@ func New(interval, jitter time.Duration, logger *slog.Logger) *Scheduler {
 
 // Trigger 手动触发一轮任务（非阻塞，已有待处理触发时忽略）。
 func (s *Scheduler) Trigger() {
-	if s.running.Load() {
-		s.logger.Info("已有审核任务，跳过手动触发")
-		return
-	}
 	select {
 	case s.trigger <- struct{}{}:
 	default:
@@ -48,14 +42,9 @@ func (s *Scheduler) Run(ctx context.Context, task func(context.Context)) {
 	s.logger.Info("调度器启动", "interval", s.interval.String(), "jitter", s.jitter.String())
 
 	runOnce := func(reason string) {
-		if !s.running.CompareAndSwap(false, true) {
-			s.logger.Info("已有审核任务，跳过本轮审查", "reason", reason)
-			return
-		}
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			defer s.running.Store(false)
 
 			// 随机抖动，避免多实例同时请求
 			if s.jitter > 0 && reason == "tick" {

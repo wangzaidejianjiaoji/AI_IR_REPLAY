@@ -68,13 +68,13 @@ func TestLoadCodeupDefaults(t *testing.T) {
 	}
 }
 
-func TestSchedulerDefaultIntervalIsThirtyMinutes(t *testing.T) {
+func TestSchedulerDefaultIntervalIsOneMinute(t *testing.T) {
 	cfg, err := Load(writeConfig(t, codeupYAML))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.Scheduler.IntervalDuration(); got != 30*time.Minute {
-		t.Fatalf("scheduler interval = %s, want 30m", got)
+	if got := cfg.Scheduler.IntervalDuration(); got != time.Minute {
+		t.Fatalf("scheduler interval = %s, want 1m", got)
 	}
 }
 

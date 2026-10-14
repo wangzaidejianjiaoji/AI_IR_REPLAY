@@ -38,9 +38,9 @@ type SchedulerConfig struct {
 	Jitter   string `yaml:"jitter"`
 }
 
-// IntervalDuration 返回轮询间隔，解析失败时回退为 30 分钟。
+// IntervalDuration 返回轮询间隔，未配置时默认为 1 分钟。
 func (s SchedulerConfig) IntervalDuration() time.Duration {
-	return parseDuration(s.Interval, 30*time.Minute)
+	return parseDuration(s.Interval, time.Minute)
 }
 
 // JitterDuration 返回抖动上限，解析失败时回退为 0。

@@ -3,8 +3,8 @@
 # 运行前注入环境变量：CODEUP_ORG_ID / CODEUP_TOKEN / KIMI_API_KEY
 
 scheduler:
-  interval: "30m"
-  jitter: "30s"
+  interval: "1m"
+  jitter: "0s"
 
 # GitHub 通道本次演练不使用（repos 留空）
 github:

@@ -16,6 +16,14 @@ import (
 
 const maxConfirmCandidates = 40
 
+const maxConfirmationBytes = 160000
+
+const confirmationSystem = `你是最终代码审查统筹确认 Agent。逐项核对候选、其源码证据、变更意图和实际逻辑。禁止新增或改写问题、位置和建议。只为输入 candidate_id 返回 confirmed=true/false 和 reason（确认、驳回或重复原因）。所有输入 ID 各返回一次；只输出 JSON：{"overview":"简述","decisions":[{"candidate_id":"输入ID","confirmed":true,"reason":"证据理由"}]}`
+
+func confirmationUser(changeContext string, encoded []byte) string {
+	return "## 全局理解与变更意图\n" + changeContext + "\n\n每个候选的 evidence 是当前版本的完整文件 diff；逐项核对，不得省略任何输入 ID。\n\n## 待确认候选问题\n" + string(encoded)
+}
+
 type confirmChatClient interface {
 	Chat(context.Context, string, []llm.Message) (string, llm.Usage, error)
 }
@@ -47,56 +55,106 @@ func (c *Confirmer) Confirm(ctx context.Context, in ConfirmationInput) (Confirma
 	if c == nil || c.client == nil {
 		return ConfirmationResult{}, llm.Usage{}, fmt.Errorf("统筹确认 Agent 未配置 LLM 客户端")
 	}
-	result := ConfirmationResult{DiffTotalBytes: len(in.Diff)}
-	visible := textbudget.Limit(in.Diff, 80000)
-	result.DiffReviewedBytes = len(visible)
-	if len(in.Candidates) == 0 {
-		result.Overview = "无候选问题，不调用确认模型"
-		return result, llm.Usage{}, nil
-	}
-	// Never validate against a hunk cut in half by the confirmation input budget.
-	if len(visible) < len(in.Diff) {
-		if i := strings.LastIndex(visible, "\ndiff --git "); i >= 0 {
-			visible = visible[:i+1]
-		} else {
-			visible = ""
-		}
-	}
-	result.DiffReviewedBytes = len(visible)
+	var result ConfirmationResult
+	var usage llm.Usage
 	files := map[string]*diff.FileDiff{}
-	for _, f := range diff.Parse(visible) {
+	for _, f := range diff.Parse(in.Diff) {
 		files[f.Path] = f
 	}
 	candidates := append([]agent.Issue(nil), in.Candidates...)
 	sort.SliceStable(candidates, func(i, j int) bool {
 		return agent.SeverityRank(candidates[i].Severity) > agent.SeverityRank(candidates[j].Severity)
 	})
-	allowed := map[string]agent.Issue{}
-	var input []confirmationCandidate
-	for _, is := range candidates {
-		f := files[is.File]
-		if f == nil || is.Line < 0 || (is.Line > 0 && !f.ContainsLine(is.Line)) {
-			continue
+	seen := map[string]bool{}
+	reviewedFiles := map[string]bool{}
+	expectedFiles := map[string]bool{}
+	var batch []agent.Issue
+	var evidence []confirmationCandidate
+	var overviews []string
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
 		}
-		b, _ := json.Marshal(is)
-		id := fmt.Sprintf("%x", sha256.Sum256(b))
-		if _, ok := allowed[id]; ok {
-			continue
+		got, u, err := c.confirmBatch(ctx, in, evidence)
+		usage.PromptTokens += u.PromptTokens
+		usage.CompletionTokens += u.CompletionTokens
+		usage.TotalTokens += u.TotalTokens
+		result.UnconfirmedCount += got.UnconfirmedCount
+		if err != nil {
+			return err
 		}
-		if len(input) >= maxConfirmCandidates {
-			break
+		result.Issues = append(result.Issues, got.Issues...)
+		result.RejectedCount += got.RejectedCount
+		overviews = append(overviews, got.Overview)
+		for _, issue := range batch {
+			if !reviewedFiles[issue.File] {
+				result.DiffReviewedBytes += len(files[issue.File].Patch)
+				reviewedFiles[issue.File] = true
+			}
 		}
-		// Evidence is the exact, versioned diff file. No model-generated replacement.
-		allowed[id] = is
-		input = append(input, confirmationCandidate{ID: id, Issue: is, Evidence: f.Patch})
+		batch = nil
+		evidence = nil
+		return nil
 	}
-	if len(input) == 0 {
-		return result, llm.Usage{}, fmt.Errorf("统筹确认缺少完整 diff 证据，拒绝确认")
+	for _, issue := range candidates {
+		f := files[issue.File]
+		if f == nil || issue.Line < 0 || (issue.Line > 0 && !f.ContainsLine(issue.Line)) {
+			return result, usage, fmt.Errorf("统筹确认缺少完整 diff 证据：%s:%d", issue.File, issue.Line)
+		}
+		raw, _ := json.Marshal(issue)
+		id := fmt.Sprintf("%x", sha256.Sum256(raw))
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if !expectedFiles[issue.File] {
+			result.DiffTotalBytes += len(f.Patch)
+			expectedFiles[issue.File] = true
+		}
+		candidate := confirmationCandidate{ID: id, Issue: issue, Evidence: f.Patch}
+		next := append(append([]confirmationCandidate(nil), evidence...), candidate)
+		encoded, _ := json.Marshal(next)
+		if len(batch) >= maxConfirmCandidates || len(confirmationUser(in.ChangeContext, encoded))+len(confirmationSystem) > maxConfirmationBytes {
+			if err := flush(); err != nil {
+				return result, usage, err
+			}
+		}
+		encoded, _ = json.Marshal(append(evidence, candidate))
+		if len(confirmationUser(in.ChangeContext, encoded))+len(confirmationSystem) > maxConfirmationBytes {
+			return result, usage, fmt.Errorf("统筹确认完整候选证据超出批次文本预算：%s；拒绝截断", issue.File)
+		}
+		batch = append(batch, issue)
+		evidence = append(evidence, candidate)
+	}
+	if err := flush(); err != nil {
+		return result, usage, err
+	}
+	// Confirmation coverage is the evidence for candidate files, not unrelated diff.
+	result.Overview = fmt.Sprintf("分批确认 %d，驳回 %d，未确认 %d。%s", len(result.Issues), result.RejectedCount, result.UnconfirmedCount, strings.Join(overviews, "；"))
+	if len(candidates) == 0 {
+		result.Overview = "无候选问题，不调用确认模型"
+	}
+	sort.SliceStable(result.Issues, func(i, j int) bool {
+		a, b := result.Issues[i], result.Issues[j]
+		if a.Severity != b.Severity {
+			return agent.SeverityRank(a.Severity) > agent.SeverityRank(b.Severity)
+		}
+		if a.File != b.File {
+			return a.File < b.File
+		}
+		return a.Line < b.Line
+	})
+	return result, usage, nil
+}
+
+func (c *Confirmer) confirmBatch(ctx context.Context, in ConfirmationInput, input []confirmationCandidate) (ConfirmationResult, llm.Usage, error) {
+	var result ConfirmationResult
+	allowed := map[string]agent.Issue{}
+	for _, candidate := range input {
+		allowed[candidate.ID] = candidate.Issue
 	}
 	encoded, _ := json.Marshal(input)
-	system := `你是最终代码审查统筹确认 Agent。逐项核对候选、其源码证据、变更意图和实际逻辑。禁止新增或改写问题、位置和建议。只为输入 candidate_id 返回 confirmed=true/false 和 reason（确认、驳回或重复原因）。所有输入 ID 各返回一次；只输出 JSON：{"overview":"简述","decisions":[{"candidate_id":"输入ID","confirmed":true,"reason":"证据理由"}]}`
-	user := "## 全局理解与变更意图\n" + in.ChangeContext + "\n\n## 当前 Diff\n" + visible + "\n\n## 待确认候选问题\n" + string(encoded)
-	content, usage, err := c.client.Chat(ctx, in.Model, []llm.Message{{Role: "system", Content: system}, {Role: "user", Content: user}})
+	content, usage, err := c.client.Chat(ctx, in.Model, []llm.Message{{Role: "system", Content: confirmationSystem}, {Role: "user", Content: confirmationUser(in.ChangeContext, encoded)}})
 	if err != nil {
 		return result, usage, fmt.Errorf("统筹确认 Agent: %w", err)
 	}
@@ -140,7 +198,10 @@ func (c *Confirmer) Confirm(ctx context.Context, in ConfirmationInput) (Confirma
 		original.AgentName = "统筹确认 Agent"
 		result.Issues = append(result.Issues, original)
 	}
-	result.UnconfirmedCount = len(in.Candidates) - len(seen)
+	result.UnconfirmedCount = len(input) - len(seen)
+	if result.UnconfirmedCount != 0 {
+		return result, usage, fmt.Errorf("统筹确认遗漏 %d 个候选，拒绝发布不完整结论", result.UnconfirmedCount)
+	}
 	result.Overview = fmt.Sprintf("确认 %d，驳回 %d，未确认 %d（候选或文本预算/遗漏）。%s", len(result.Issues), result.RejectedCount, result.UnconfirmedCount, raw.Overview)
 	sort.SliceStable(result.Issues, func(i, j int) bool {
 		a, b := result.Issues[i], result.Issues[j]

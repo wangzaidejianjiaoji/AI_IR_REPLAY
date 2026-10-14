@@ -1,6 +1,6 @@
 # config.mock.yaml — 冒烟测试配置：LLM 指向本地 Mock 服务，Dry-Run 只输出评论
 scheduler:
-  interval: "30m"
+  interval: "1m"
   jitter: "0s"
 
 github:

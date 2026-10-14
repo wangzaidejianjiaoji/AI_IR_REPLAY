@@ -2,7 +2,7 @@
 //
 // 用法示例：
 //
-//	gvs-pr-agent -config configs/config.yaml            # 常驻运行（30 分钟轮询）
+//	gvs-pr-agent -config configs/config.yaml            # 常驻运行（每分钟轮询）
 //	gvs-pr-agent -config configs/config.yaml -once      # 只跑一轮后退出
 //	gvs-pr-agent -config configs/config.yaml -dry-run   # 只审查不发布评论
 //	gvs-pr-agent -rule my-rules.yaml ...                # CLI 指定规则文档（四层链最高优先级）

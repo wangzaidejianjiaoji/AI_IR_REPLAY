@@ -66,7 +66,7 @@ func BuildComment(sum coordinator.Summary, opt Options) string {
 	sb.WriteString("### 统筹确认总览\n\n")
 	writeOverview(&sb, sum.CoordinationOverview, "统筹确认阶段未返回额外说明；以下为经定位和反思过滤后的问题。")
 	if sum.ConfirmationTotalBytes > 0 {
-		fmt.Fprintf(&sb, "最终确认输入：%d/%d 字节；未确认候选：%d。\n\n", sum.ConfirmationReviewedBytes, sum.ConfirmationTotalBytes, sum.UnconfirmedCount)
+		fmt.Fprintf(&sb, "最终确认候选文件证据：%d/%d 字节；未确认候选：%d。\n\n", sum.ConfirmationReviewedBytes, sum.ConfirmationTotalBytes, sum.UnconfirmedCount)
 	}
 
 	sb.WriteString("### 确认的问题\n\n")

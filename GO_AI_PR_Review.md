@@ -1,6 +1,6 @@
 # AI_IR_REPLAY：AI 代码审查项目说明与实施边界
 
-> 文档维护日期：2026-10-14。实现依据：HEAD（当前检出提交）ca57fa55 加核对时的未提交工作区源码与配置；测试记录来自 2026-10-13，本次仅补充文档说明，未重新运行测试。工作区改动尚未形成新的提交版本；本文区分实现、测试结果和建议，不代表线上验收结论。历史全量测试有一项知识来源隔离失败，见第 8 节。
+> 文档维护日期：2026-10-14。实现依据：HEAD（当前检出提交）ca57fa55 加核对时的未提交工作区源码与配置；测试记录来自 2026-10-13，2026-10-14 增加每分钟轮询和任务状态去重，重新验证相关包；历史测试记录保留在第 8 节。工作区改动尚未形成新的提交版本；本文区分实现、测试结果和建议，不代表线上验收结论。历史全量测试有一项知识来源隔离失败，见第 8 节。
 
 ## 1. 项目定位与阅读入口
 
@@ -56,7 +56,7 @@ AI_IR_REPLAY（项目名；Go module 即 Go 模块名为 gvs-pr-agent，表示�
 
 | 能力 | 实际作用 | 典型场景 | 实现位置 | 开关、条件与边界 |
 |---|---|---|---|---|
-| GitHub 未关闭的 PR 审查 | 定期发现尚未合并的代码申请，读取差异并检查是否已审过该提交 | 团队使用 GitHub 提交功能或修复，希望在人工合并前收到辅助报告 | internal/github、internal/review | 配置 github.repos（目标仓库列表）；按目标分支过滤，跳过 WIP（开发中）及冲突申请，用评论里的提交 SHA 去重；发布另需 notification.pr_comment=true 且 dry_run=false |
+| GitHub 未关闭的 PR 审查 | 定期发现尚未合并的代码申请，读取差异并检查是否已审过该提交 | 团队使用 GitHub 提交功能或修复，希望在人工合并前收到辅助报告 | internal/github、internal/review | 配置 github.repos（目标仓库列表）；按目标分支过滤，跳过 WIP（开发中）及冲突申请，用评论里的提交 SHA 及进程内已完成状态去重，待审核/审核中禁止重复领取；发布另需 notification.pr_comment=true 且 dry_run=false |
 | Codeup 分支增量审查 | 比较已记录基线与分支当前提交，只审查两者之间的变化 | 开发者推送分支但还没有创建合并请求，希望提前发现风险 | internal/codeup、internal/state | codeup.enabled=true；默认首次只记录基线；codeup.review_first_push=true 才在首次对比配置的基准分支；提交评论由 codeup.commit_comment 控制 |
 | Codeup 未关闭的 MR 审查 | 按合并请求版本读取差异，以固定提交版本审查并去重 | 以 Codeup 合并请求作为评审入口，需要对每个新版本形成报告 | internal/review | 需 codeup.enabled=true、codeup.mr_review=true；过滤源分支；审查后版本变化则放弃发布及基线推进；MR 评论另由 codeup.mr_comment 控制 |
 | 本地补丁审查 | 读取指定差异文件，打印报告，便于验证流程 | 尚未推送代码、复现历史问题、用固定补丁做模型对比或本地演示 | cmd/agent 的 -diff 参数 | -diff 指定补丁路径；不访问 GitHub，但理解开启时仍会访问 Codeup；模型请求仍存在；使用随附本地 Mock（模拟服务）配置时可演示离线流程 |
@@ -64,7 +64,7 @@ AI_IR_REPLAY（项目名；Go module 即 Go 模块名为 gvs-pr-agent，表示�
 | 持久化代码理解 | 把模块、调用链与业务约束保存为本地知识，来源提交变化时更新 | 连续审查同一业务仓库，希望利用版本化背景理解局部改动 | internal/understanding | understanding.enabled=true；首次初始化需 understanding.snapshot_repository 的本地 Git 源码对象；更新失败由 understanding.strict 决定阻断或降级；来源隔离存在已记录缺陷 |
 | 每次变更理解与统筹确认 | 先分析本次改动的意图，再对专业角色发现的问题逐项作确认判断 | 多个角色提出相近问题，或需要结合业务目的判断某变化是否有风险 | internal/analyzer、internal/coordinator/confirmer.go | 随 understanding.enabled 一起装配，当前没有独立开关；关闭时走兼容流程；确认有候选数量及文本预算限制，模型确认不等于人工验收 |
 | 规则优先级与热更新 | 选择当前规则，并组合全局、角色与命中路径的检查要求 | 各项目规范不同，需覆盖默认规则；运行期间调整规则而不重启服务 | internal/rules | -rule、rules.project_path、rules.global_path、内嵌默认按顺序选一份规则；rules.hot_reload 开启轮询当前规则文件，不把四层文件合并 |
-| 定时与手动触发 | 按周期发现变更，也允许通过管理接口发起轮次 | 常驻审查服务定期巡检；测试人员在指定推送后主动触发 | internal/scheduler、cmd/agent | scheduler.interval/jitter 控制间隔/抖动；启动立即一轮，忙时跳过新触发；手动触发需要管理令牌，RunOnce（一轮执行方法）仍受时间窗口限制 |
+| 定时与手动触发 | 按周期发现变更，也允许通过管理接口发起轮次 | 常驻审查服务定期巡检；测试人员在指定推送后主动触发 | internal/scheduler、cmd/agent | scheduler.interval/jitter 控制间隔/抖动；启动立即一轮，默认每分钟扫描；扫描轮次可重叠，待审核/审核中任务去重，实际审核串行执行；手动触发需要管理令牌，RunOnce（一轮执行方法）仍受时间窗口限制 |
 | 报告与平台评论 | 生成包含变更总结、问题、失败与覆盖情况的统一报告 | 研发定位问题、测试核验风险、负责人检查本次是否审查完整 | internal/notifier | notification.pr_comment、codeup.commit_comment、codeup.mr_comment 分别控制三类评论；review.dry_run 禁止发布；均为全局评论，不是逐行 inline（行内）评论 |
 | 轮次预算与取消 | 将知识、分析、专业作业、确认及重试纳入同一轮约束 | 多仓库、大补丁或频繁重试可能放大成本，需要限制调用量和运行时间 | internal/llm/budget.go、internal/review/budget.go | review.max_llm_calls、max_round_tokens、round_timeout 控制调用/估算预留量/时长；max_round_cost>0 才开启费用估算限制；不是精确账单上限 |
 | 覆盖及失败披露 | 分开报告文件纳入、文本截断、未确认候选与成功/失败作业 | 报告没有问题时，仍需判断是否存在未读文本或失败角色 | internal/coordinator、internal/notifier | 随流水线统计；部分失败仍可输出报告，零作业或全部作业失败阻断；字节覆盖不等于语义覆盖 |
@@ -131,14 +131,14 @@ GVS 与 gvs_infer 是被审查的业务仓库，不是审查服务的运行依�
 
 | 状态 | 保存位置 | 注意事项 |
 |---|---|---|
-| GitHub PR 已审 SHA | 评论 HTML（网页标记格式）隐藏标记 | 两实例同时查不到标记时仍可能重复发布 |
+| GitHub PR 已审 SHA | 评论 HTML（网页标记格式）隐藏标记及进程内完成状态 | 两实例同时查不到标记时仍可能重复发布 |
 | Codeup 分支/MR 基线 | codeup.state_path JSON | Store（状态存储对象）有进程内 mutex（互斥锁）；CLI 入口另获取 state_path.lock（状态路径对应的锁文件）的操作系统锁 |
 | 全局知识与来源 SHA | understanding.document_path | 同目录临时文件替换，进程内串行；CLI 获取 document_path.lock |
 | 冲突日志去重 | 内存 conflictTracker（冲突记录跟踪器） | 重启清空 |
 
 因此项目是轻量的混合状态服务。CLI 对共用状态/知识路径提供单机实例互斥，纯 GitHub 常驻或 -once 使用 ./data/github-agent.lock；直接调用 Service 不自动获得这些锁。不同路径或主机仍可能重复发布，不能把操作系统锁和 SHA 标记描述为分布式高可用保障。
 
-**dry-run 仅禁止评论发布。** 它仍可能访问仓库和外部模型、产生费用、写入理解文档并推进 Codeup 分支/MR 基线。演示/试点必须使用独立 state_path，必要时使用理解文档副本。GitHub dry-run 不写平台评论标记，因此可能反复审查同一 SHA。
+**dry-run 仅禁止评论发布。** 它仍可能访问仓库和外部模型、产生费用、写入理解文档并推进 Codeup 分支/MR 基线。演示/试点必须使用独立 state_path，必要时使用理解文档副本。GitHub dry-run 不写平台评论标记；本进程内已完成 SHA 会去重，重启后仍可能重复审查。
 
 报告固定包含本次代码变更总结、验证总览、统筹确认总览、确认的问题和元数据。重点特色的具体流程、场景与限制见第 10 节，配置与源码英文名称的中文对照见第 11 节。关闭理解模块时，沿用这些标题并不代表真实执行了理解/确认。max_issues_display（详细展示问题数上限）只限制详细展示，应同时阅读完整问题摘要和失败记录。
 
@@ -158,7 +158,7 @@ GVS 与 gvs_infer 是被审查的业务仓库，不是审查服务的运行依�
 
 当前 Docker Compose（容器组合部署工具）挂载 configs:ro（配置目录只读）、data（状态数据目录）、docs（知识与文档目录），并传递 Codeup 凭据；宿主端口只绑定 127.0.0.1。容器管理地址通过 AGENT_SERVER_ADDR=0.0.0.0:8081 覆盖，启动要求 AGENT_ADMIN_TOKEN。首次知识初始化还需本地 Git 对象和 snapshot_repository，现有 Compose 未挂载业务 Git 仓库；不能仅凭配置文件存在认定部署完成。具体步骤见部署与验收文档。
 
-GET /health（读取健康检查接口）只返回进程存活状态，不验证模型、仓库权限和审查成功率。POST /trigger（提交手动触发请求）要求 Bearer（持有令牌即可认证的方式）管理令牌；无令牌时返回 503，认证失败返回 401，认证通过返回 202 仍不保证本轮执行。默认监听 127.0.0.1:8081，非回环地址必须配置令牌；该 HTTP 服务本身不提供 TLS（传输层加密）。容器隔离不等于数据不外发，diff 与知识内容会进入配置的外部模型服务，报告还可能进入日志和平台评论。
+GET /health（读取健康检查接口）只返回进程存活状态，不验证模型、仓库权限和审查成功率。POST /trigger（提交手动触发请求）要求 Bearer（持有令牌即可认证的方式）管理令牌；无令牌时返回 503，认证失败返回 401，认证通过返回 202 表示请求扫描，仍不保证任务完成（时间窗口及任务状态可能跳过）。默认监听 127.0.0.1:8081，非回环地址必须配置令牌；该 HTTP 服务本身不提供 TLS（传输层加密）。容器隔离不等于数据不外发，diff 与知识内容会进入配置的外部模型服务，报告还可能进入日志和平台评论。
 
 ## 8. 当前实现、验证结果与剩余问题
 

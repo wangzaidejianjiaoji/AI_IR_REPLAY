@@ -5,8 +5,8 @@
 # 用法：gvs-pr-agent -config configs/config-gvs.yaml -once
 
 scheduler:
-  interval: "30m"
-  jitter: "30s"
+  interval: "1m"
+  jitter: "0s"
 
 # GitHub 通道不使用（repos 留空）
 github:
@@ -70,14 +70,14 @@ agents:
   dataflow:    { enabled: true, priority: 1 }
 
 review:
-  max_llm_calls: 100
-  max_round_tokens: 1000000
-  round_timeout: "20m"
+  max_llm_calls: 600
+  max_round_tokens: 12000000 # 保守输入/输出预留预算，不等于实际账单 Token
+  round_timeout: "60m"
   max_round_cost: 0 # Set only with verified llm.prices in a single currency
-  dry_run: true                            # 默认只审查不发布；-dry-run 可再次强制
-  max_diff_chars: 60000
+  dry_run: false                           # 常驻运行发布 MR 评论；-dry-run 可临时禁止发布
+  max_diff_chars: 120000
   max_agent_concurrency: 4
-  max_files_per_review: 20                 # 超出即判定覆盖不完整并失败，禁止抽样通过
+  max_files_per_review: 100                # 筛选后文件数上限；按文件数和文本预算分包，不抽样
   file_packaging:
     enabled: true
     max_package_size: 5

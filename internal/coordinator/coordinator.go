@@ -162,7 +162,7 @@ func (c *Coordinator) Run(ctx context.Context, base agent.Task, pkgs []packager.
 			sum.TruncatedPackages = append(sum.TruncatedPackages, pkg.Name)
 		}
 	}
-	if c.confirmer != nil && !sum.AllFailed {
+	if c.confirmer != nil && !sum.AllFailed && sum.FailedJobs == 0 && len(sum.TruncatedPackages) == 0 {
 		var fullDiff strings.Builder
 		for _, file := range files {
 			fullDiff.WriteString(file.Patch)

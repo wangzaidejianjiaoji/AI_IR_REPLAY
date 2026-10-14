@@ -2,8 +2,25 @@ package packager
 
 import (
 	"gvs-pr-agent/internal/diff"
+	"strings"
 	"testing"
 )
+
+func TestPackBoundedCoversEveryFileWithoutTruncation(t *testing.T) {
+	files := []*diff.FileDiff{{Path: "a.go", Patch: strings.Repeat("a", 60)}, {Path: "b.go", Patch: strings.Repeat("b", 60)}}
+	pkgs, err := PackBounded(files, 5, 100)
+	if err != nil || len(pkgs) != 2 {
+		t.Fatalf("packages=%v error=%v", pkgs, err)
+	}
+	for i, p := range pkgs {
+		if p.DiffText(0) != files[i].Patch {
+			t.Fatal("file content lost")
+		}
+	}
+	if _, err := PackBounded([]*diff.FileDiff{{Path: "huge.go", Patch: strings.Repeat("x", 101)}}, 5, 100); err == nil {
+		t.Fatal("oversized file silently accepted")
+	}
+}
 
 func TestInferSpecialistCoverage(t *testing.T) {
 	for _, tc := range []struct {

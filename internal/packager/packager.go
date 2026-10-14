@@ -4,6 +4,7 @@
 package packager
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 
@@ -11,6 +12,35 @@ import (
 	"gvs-pr-agent/internal/filter"
 	"gvs-pr-agent/internal/textbudget"
 )
+
+// PackBounded retains complete file patches; it never truncates review evidence.
+func PackBounded(files []*diff.FileDiff, maxFiles, maxBytes int) ([]Package, error) {
+	var out []Package
+	for _, pkg := range Pack(files, maxFiles) {
+		part := Package{Name: pkg.Name}
+		bytes := 0
+		flush := func() {
+			if len(part.Files) > 0 {
+				part.Name = fmt.Sprintf("%s-%d", pkg.Name, len(out)+1)
+				out = append(out, part)
+				part = Package{Name: pkg.Name}
+				bytes = 0
+			}
+		}
+		for _, file := range pkg.Files {
+			if maxBytes > 0 && len(file.Patch) > maxBytes {
+				return nil, fmt.Errorf("审查覆盖不完整：文件 %s 的 diff 为 %d 字节，超过 max_diff_chars=%d；拒绝截断审核", file.Path, len(file.Patch), maxBytes)
+			}
+			if maxBytes > 0 && bytes+len(file.Patch) > maxBytes {
+				flush()
+			}
+			part.Files = append(part.Files, file)
+			bytes += len(file.Patch)
+		}
+		flush()
+	}
+	return out, nil
+}
 
 // Package 一个审查包：一组关联文件构成的独立审查单元。
 type Package struct {
@@ -90,7 +120,7 @@ func Pack(files []*diff.FileDiff, maxPackageSize int) []Package {
 			}
 			pkgName := name
 			if len(group) > maxPackageSize {
-				pkgName = name + "-" + string(rune('1'+i/maxPackageSize))
+				pkgName = fmt.Sprintf("%s-%d", name, i/maxPackageSize+1)
 			}
 			out = append(out, Package{Name: pkgName, Files: group[i:end]})
 		}

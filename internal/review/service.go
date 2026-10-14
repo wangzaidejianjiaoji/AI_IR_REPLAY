@@ -78,6 +78,7 @@ type Service struct {
 	logger     *slog.Logger
 	tz         *time.Location
 	conflictTr *conflictTracker // 冲突 PR/MR 日志去重跟踪器
+	tasks      taskTracker
 }
 
 // NewService 组装审查服务的全部依赖。
@@ -164,6 +165,7 @@ func NewService(cfg *config.Config, cliRulePath string, logger *slog.Logger) (*S
 		logger:     logger,
 		tz:         tz,
 		conflictTr: &conflictTracker{},
+		tasks:      taskTracker{logger: logger},
 	}, nil
 }
 
@@ -245,6 +247,13 @@ func (s *Service) reviewRepo(ctx context.Context, repo config.RepoConfig) error 
 
 // reviewPR 审查单个 PR。
 func (s *Service) reviewPR(ctx context.Context, repo config.RepoConfig, pr *github.PullRequest) error {
+	key := fmt.Sprintf("github:%s/%s:%d", repo.Owner, repo.Repo, pr.Number)
+	return s.tasks.run(ctx, key, pr.Head.SHA, func() error {
+		return s.reviewPRSnapshot(ctx, repo, pr)
+	})
+}
+
+func (s *Service) reviewPRSnapshot(ctx context.Context, repo config.RepoConfig, pr *github.PullRequest) error {
 	full := repo.Owner + "/" + repo.Repo
 	log := s.logger.With("repo", full, "pr", pr.Number, "sha", short(pr.Head.SHA))
 
@@ -270,7 +279,8 @@ func (s *Service) reviewPR(ctx context.Context, repo config.RepoConfig, pr *gith
 			if s.conflictTr.mark(key) {
 				log.Info("跳过 PR：存在合并冲突，等待开发者解决后自动重审", "error", err.Error())
 			}
-			return nil
+			// A conflict is not a completed review; allow the same SHA to retry.
+			return err
 		}
 		return err
 	}
@@ -320,7 +330,7 @@ func (s *Service) reviewDiff(ctx context.Context, rawDiff, repoFullName, title, 
 		log.Info("跳过：筛选后无待审查文件", "total_files", len(allFiles))
 		return nil, nil
 	}
-	totalFiltered := len(files) // 筛选后总数（超限截断前，报告披露用）
+	totalFiltered := len(files)
 	if len(files) > s.cfg.Review.MaxFilesPerReview {
 		return nil, fmt.Errorf("审查覆盖不完整：筛选后有 %d 个文件，超过 max_files_per_review=%d；请拆分变更或提高上限后重新执行",
 			len(files), s.cfg.Review.MaxFilesPerReview)
@@ -329,9 +339,18 @@ func (s *Service) reviewDiff(ctx context.Context, rawDiff, repoFullName, title, 
 	// 【确定性工程】智能文件打包：关联文件归并为审查包，上下文隔离
 	var pkgs []packager.Package
 	if s.cfg.Review.FilePackaging.Enabled {
-		pkgs = packager.Pack(files, s.cfg.Review.FilePackaging.MaxPackageSize)
+		var err error
+		pkgs, err = packager.PackBounded(files, s.cfg.Review.FilePackaging.MaxPackageSize, s.cfg.Review.MaxDiffChars)
+		if err != nil {
+			return nil, err
+		}
 	} else {
 		pkgs = []packager.Package{{Name: "全部变更", Files: files}}
+	}
+	for _, pkg := range pkgs {
+		if s.cfg.Review.MaxDiffChars > 0 && len(pkg.DiffText(0)) > s.cfg.Review.MaxDiffChars {
+			return nil, fmt.Errorf("审查覆盖不完整：包 %s 的 diff 超过 max_diff_chars=%d；请启用文件分包或提高预算，拒绝截断审核", pkg.Name, s.cfg.Review.MaxDiffChars)
+		}
 	}
 	var pkgNames []string
 	for i := range pkgs {
@@ -374,10 +393,19 @@ func (s *Service) reviewDiff(ctx context.Context, rawDiff, repoFullName, title, 
 			}
 		}
 		var analyzeErr error
-		changeContext, analysisUsage, analyzeErr = s.analyzer.Analyze(ctx, analyzer.Input{
+		analysisInput := analyzer.Input{
 			Repository: repoFullName, Title: title, Body: body,
-			Diff: analysisDiff(files, s.cfg.Review.MaxDiffChars), GlobalUnderstanding: globalDocument, Model: model,
-		})
+			Diff: analysisDiff(files, 0), GlobalUnderstanding: globalDocument, Model: model,
+		}
+		if len(analysisInput.Diff) > s.cfg.Review.MaxDiffChars && s.cfg.Review.MaxDiffChars > 0 {
+			var batches []string
+			for _, pkg := range pkgs {
+				batches = append(batches, pkg.DiffText(0))
+			}
+			changeContext, analysisUsage, analyzeErr = s.analyzer.AnalyzeBatches(ctx, analysisInput, batches, s.cfg.Review.MaxDiffChars)
+		} else {
+			changeContext, analysisUsage, analyzeErr = s.analyzer.Analyze(ctx, analysisInput)
+		}
 		if analyzeErr != nil {
 			return nil, analyzeErr
 		}
@@ -399,10 +427,10 @@ func (s *Service) reviewDiff(ctx context.Context, rawDiff, repoFullName, title, 
 		MaxDiffChars: s.cfg.Review.MaxDiffChars,
 		AssignAgents: s.cfg.Review.FilePackaging.Enabled,
 	})
-	summary.TotalFiles, summary.Reviewed = totalFiltered, len(files) // 超限截断披露
+	summary.TotalFiles, summary.Reviewed = totalFiltered, len(files)
 	summary.AnalysisTotalBytes = len(analysisDiff(files, 0))
 	if s.analyzer != nil {
-		summary.AnalysisReviewedBytes = len(textbudget.Limit(analysisDiff(files, 0), s.cfg.Review.MaxDiffChars))
+		summary.AnalysisReviewedBytes = summary.AnalysisTotalBytes
 	}
 	summary.ChangeSummary = changeContext.Summary
 	if changeContext.Intent != "" {
@@ -434,6 +462,9 @@ func (s *Service) reviewDiff(ctx context.Context, rawDiff, repoFullName, title, 
 	if summary.AllFailed {
 		return nil, fmt.Errorf("全部 Agent 审查失败（%s），放弃本次结果",
 			strings.Join(summary.FailedRoles, "、"))
+	}
+	if summary.FailedJobs > 0 || len(summary.TruncatedPackages) > 0 || summary.UnconfirmedCount > 0 {
+		return nil, fmt.Errorf("审查覆盖不完整：失败作业 %d、截断包 %d、未确认候选 %d；不发布评论或推进成功基线", summary.FailedJobs, len(summary.TruncatedPackages), summary.UnconfirmedCount)
 	}
 	if summary.ConfirmationError != "" {
 		return nil, fmt.Errorf("统筹确认失败，放弃发布未经确认的问题: %s", summary.ConfirmationError)
@@ -517,6 +548,14 @@ func (s *Service) reviewCodeupRepo(ctx context.Context, repo config.CodeupRepoCo
 // 对比基准分支全量审查）；其余情况对 基线..HEAD 做增量审查。
 // 审查成功后才推进基线，失败时下轮重试。
 func (s *Service) reviewBranchPush(ctx context.Context, repo config.CodeupRepoConfig,
+	br *codeup.Branch, baseBranch string) error {
+	key := "branch:" + repo.RepositoryID + ":" + br.Name
+	return s.tasks.run(ctx, key, br.Commit.ID, func() error {
+		return s.reviewBranchSnapshot(ctx, repo, br, baseBranch)
+	})
+}
+
+func (s *Service) reviewBranchSnapshot(ctx context.Context, repo config.CodeupRepoConfig,
 	br *codeup.Branch, baseBranch string) error {
 
 	name := repo.DisplayName()
@@ -619,6 +658,16 @@ func (s *Service) reviewCodeupMRs(ctx context.Context, repo config.CodeupRepoCon
 // reviewChangeRequest 审查单个合并请求：以合并源最新版本的 CommitID 作去重基线，
 // diff 取 目标分支..源分支（Merge-Base），结果发布为 MR 全局评论。
 func (s *Service) reviewChangeRequest(ctx context.Context, repo config.CodeupRepoConfig,
+	mr *codeup.ChangeRequest) error {
+	key := fmt.Sprintf("mr:%s:%d", repo.RepositoryID, mr.LocalID)
+	// Claim the MR before fetching patch sets. Completed versions are deduplicated
+	// by the persistent baseline inside reviewChangeRequestSnapshot.
+	return s.tasks.run(ctx, key, "", func() error {
+		return s.reviewChangeRequestSnapshot(ctx, repo, mr)
+	})
+}
+
+func (s *Service) reviewChangeRequestSnapshot(ctx context.Context, repo config.CodeupRepoConfig,
 	mr *codeup.ChangeRequest) error {
 
 	name := repo.DisplayName()

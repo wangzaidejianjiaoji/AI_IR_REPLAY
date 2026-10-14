@@ -58,7 +58,9 @@ func Parse(raw string) []*FileDiff {
 	}
 
 	scanner := bufio.NewScanner(strings.NewReader(raw))
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	// The complete input is already in memory. Do not silently stop at a long
+	// source line: review admission/text budgets decide whether it is accepted.
+	scanner.Buffer(make([]byte, 1024*1024), max(1024*1024, len(raw)+1))
 	for scanner.Scan() {
 		line := scanner.Text()
 
