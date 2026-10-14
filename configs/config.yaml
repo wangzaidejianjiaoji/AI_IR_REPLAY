@@ -1,0 +1,190 @@
+# config.yaml — GVS 项目 AI PR 审查 Agent 配置（demo）
+# 敏感信息通过环境变量注入：GITHUB_TOKEN / KIMI_API_KEY
+
+# ============================================================
+# 定时轮询配置
+# ============================================================
+scheduler:
+  interval: "30m"                 # 轮询间隔（开发调试可改为 30s）
+  jitter: "30s"                   # 随机抖动，避免所有实例同时请求
+
+# ============================================================
+# GitHub 配置
+# ============================================================
+github:
+  api_base: "https://api.github.com"
+  token: "${GITHUB_TOKEN}"        # 从环境变量读取
+
+  repos:
+    - owner: "your-org"           # TODO: 替换为实际组织名/用户名
+      repo: "gvs"                 # TODO: 替换为实际仓库名
+      branch_filter:              # 只审查目标分支匹配的 PR
+        include:
+          - "main"
+          - "develop"
+          - "release/*"
+        exclude:
+          - "dependabot/**"
+
+  per_page: 30                    # PR 列表每页数量
+
+# ============================================================
+# Codeup 配置（提交分支即审查：轮询分支 HEAD 变化，增量审查新提交）
+# ============================================================
+codeup:
+  enabled: false                  # 启用后每轮轮询扫描下列仓库的分支推送
+  domain: "openapi-rdc.aliyuncs.com"  # 云效 OpenAPI 服务接入点（中心版）
+  organization_id: "${CODEUP_ORG_ID}" # 组织 ID（组织管理后台-基本信息页获取）
+  token: "${CODEUP_TOKEN}"        # 个人访问令牌（x-yunxiao-token）
+
+  repos:
+    - repository_id: "lzvsg/gvs"  # 代码库 ID 或全路径（组织/仓库，自动 URL 编码）
+      name: "lzvsg/gvs"           # 日志展示名
+      base_branch: "master"       # 基准分支（不做推送审查；首次全量审查的对比基线）
+      branch_filter:              # 只审查分支名匹配的推送（作用于源分支）
+        include: []               # 为空表示不限制，如 ["feature/*", "fix/*"]
+        exclude:
+          - "release/*"
+
+  per_page: 100                   # 分支列表每页数量
+  state_path: "./data/branch-state.json"  # 分支审查基线存储（增量 diff 与去重）
+  review_first_push: false        # 首次发现分支时是否对比基准分支全量审查（默认仅记录基线）
+  commit_comment: true            # 审查结果回写为 commit 评论（受 review.dry_run 双重保险）
+  mr_review: true                 # 审查 Codeup 开启状态的合并请求（新版 MR）
+  mr_comment: true                # 审查结果回写为 MR 全局评论（受 review.dry_run 双重保险）
+
+# ============================================================
+# LLM 配置（kimi / Moonshot，OpenAI 兼容格式）
+# ============================================================
+llm:
+  provider: "kimi"
+  api_key: "${KIMI_API_KEY}"      # 从环境变量读取
+  base_url: "https://api.moonshot.cn/v1"
+
+  # 模型分级（根据 PR diff 变更行数自动选择）
+  models:
+    small: "moonshot-v1-8k"       # 小 PR（< 500 行变更）
+    medium: "moonshot-v1-32k"     # 中 PR（500-3000 行）
+    large: "moonshot-v1-128k"     # 大 PR（> 3000 行）
+  model_thresholds:
+    small: 500
+    medium: 3000
+
+  timeout: "120s"
+  max_tokens: 4000
+  temperature: 0.3                # 低温度保证输出稳定
+
+  # 重试策略（指数退避）
+  retry:
+    max_attempts: 3
+    base_delay: "2s"
+    max_delay: "30s"
+
+# ============================================================
+# 多 Agent 配置（11 角色）
+# ============================================================
+agents:
+  architect:   { enabled: true, priority: 1 }
+  security:    { enabled: true, priority: 1 }
+  performance: { enabled: true, priority: 1 }
+  standard:    { enabled: true, priority: 2 }
+  test:        { enabled: true, priority: 2 }
+  ai:          { enabled: true, priority: 2 }
+  ui:          { enabled: true, priority: 2 }
+  ai_tool:     { enabled: true, priority: 2 }
+  concurrency: { enabled: true, priority: 1 }
+  resource:    { enabled: true, priority: 1 }
+  dataflow:    { enabled: true, priority: 1 }
+
+# ============================================================
+# 审查配置
+# ============================================================
+review:
+  max_llm_calls: 100
+  max_round_tokens: 1000000
+  round_timeout: "20m"
+  max_round_cost: 0 # Set only with verified llm.prices in a single currency
+  dry_run: true                   # demo 模式：只审查不发布评论（与 notification.pr_comment 双重保险）
+  max_diff_chars: 60000           # 单包 diff 超长截断（字符数）
+  max_agent_concurrency: 4        # 每批并发的 Agent 数量
+  max_files_per_review: 20        # 单次审查最大文件数
+
+  # 文件打包配置（确定性工程：关联文件归并为同一审查包，上下文隔离）
+  file_packaging:
+    enabled: true
+    max_package_size: 5           # 每个包最多 5 个文件，超出拆分子包
+
+  # 评论定位（确定性工程：行级精度校验，行号偏移时尝试重定位）
+  comment_location:
+    enabled: true
+    verify_line_number: true
+
+  # 评论反思（确定性工程：幻觉校验 + 建议代码语法校验 + 跨 Agent 去重）
+  comment_reflection:
+    enabled: true
+    check_hallucination: true
+
+  # 审查时间窗口（避免夜间打扰，与 GVS 日夜模式对应）；留空表示不限制
+  active_hours:
+    start: ""                     # 如 "09:00"
+    end: ""                       # 如 "21:00"
+    timezone: "Asia/Shanghai"
+
+  include_paths: []               # 为空表示不限制；GVS 主仓库可填 ["gvs/", "qatool/"]
+  exclude_paths:
+    - "**/vendor/**"
+    - "**/*_test.go"
+    - "**/ffmpeg_exe/**"
+    - "**/weights/**"
+    - "**/testvideo/**"
+    - "**/*.md"
+    - "**/*.yml"
+    - "**/*.yaml"
+    - "**/*.json"
+    - "**/*.sum"
+    - "**/*.mod"
+
+# ============================================================
+# 规则文档配置（四层优先级链：CLI -rule > project_path > global_path > 内嵌默认）
+# ============================================================
+rules:
+  project_path: "./configs/review-rules-gvs.yaml"
+  global_path: "~/.ai-review/review-rules.yaml"
+  hot_reload: true                # 规则文档热更新（与 GVS site.yml 热更新机制一致）
+  reload_interval: "30s"          # 轮询文件变化间隔
+
+# ============================================================
+# 全局代码理解：gvs/main 变化时更新 AI_IR_REPLAY 本地的唯一理解文档
+# ============================================================
+understanding:
+  enabled: false                 # Codeup 通道启用后再开启；config-codeup.yaml 已开启
+  source_repository: "lizheng/lzvsg/gvs"
+  source_branch: "main"
+  document_path: "./docs/gvs-code-understanding.md"
+  seed_path: "./GO_AI_PR_Review.md"
+  strict: false
+
+# ============================================================
+# 通知配置
+# ============================================================
+notification:
+  pr_comment: false               # demo 模式：禁用 PR 评论发布，审查报告只输出到日志
+  mention_author: true            # @mention 提交人
+  mention_reviewers: true         # @mention Assignee / Reviewer
+  max_issues_display: 10          # 评论中最多展开显示的问题数，超出折叠
+
+# ============================================================
+# 日志配置（与 GVS 日志体系一致）
+# ============================================================
+logging:
+  level: "info"                   # debug/info/warn/error
+  format: "gvs"                   # json/text/gvs（gvs = gvlogger 的 "[I]" 前缀风格）
+  output: "stdout"                # stdout/file/both
+  file_path: "/opt/lz/log/pr-agent.log"  # 与 GVS 共享 /opt/lz/log 目录（output 含 file 时生效）
+
+# ============================================================
+# 服务配置（健康检查 + 手动触发）
+# ============================================================
+server:
+  admin_token: "${AGENT_ADMIN_TOKEN}"
+  addr: "127.0.0.1:8081"                   # GET /health 健康检查；POST /trigger 手动触发一轮审查

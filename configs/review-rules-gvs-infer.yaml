@@ -1,0 +1,282 @@
+# review-rules-gvs-infer.yaml — GVS Infer 项目审查规则文档（v1.2）
+# 规则按 Agent 角色组织，Prompt 引擎会将匹配的规则注入到各 Agent 的提示词中
+# 本规则基于 gvs_infer C++17 项目代码实践 + C++ Core Guidelines + TensorRT/GStreamer 最佳实践制定
+# 适用项目：gvs_infer（C++17 CUDA 推理服务）
+# v1.2：补充 test_model 测速有效性、ground SDK 测速失败、CTest 覆盖真实链路与构建产物规则
+
+version: "1.2"
+
+# ============================================================
+# 全局规则：所有 Agent 共享
+# ============================================================
+global:
+  # 项目基础信息
+  - "gvs_infer 是基于 C++17 的 CUDA 推理服务，使用 TensorRT + GStreamer + gRPC + OpenCV + spdlog，运行于 Ubuntu 22.04（x86_64/aarch64）"
+  - "核心架构：Model 基类（纯虚接口）→ ModelFactory（工厂模式）→ ModelManager（单例管理）→ InferServiceImpl（gRPC 服务）"
+  - "模型类型：YOLOv5、YOLOv26、DEIMv2（双引擎天空/地面）、EfficientNet（分类器）、OSTrack（跟踪器）"
+  - "流媒体管线：GStreamer Pipeline（RTSP 输入 → NV12 解码 → InferenceEngine 推理 → RTMP/文件输出）"
+  - "必须注意 CUDA 显存、GStreamer 对象引用计数、线程 join/detach、cv::Mat 生命周期的正确管理"
+
+  # 审查范围与原则
+  - "只审查本次 diff 中的变更代码，不要评论未变更的代码"
+  - "问题必须基于 diff 中实际存在的代码，禁止臆测不存在的代码（避免幻觉）"
+  - "评论使用中文，建议要具体可操作，能给出参考代码时给出"
+  - "优先关注正确性、安全性、性能问题，其次才是风格问题"
+  - "MR 标题、描述与实际 diff 范围必须一致；文件数或 diff 预算超限时必须明确失败并要求拆分或提高上限，禁止只审前 N 个文件后给出完整结论"
+  - "生成物、模型权重、测试图片、共享库和可执行文件必须说明来源、用途、许可证与可复现方式；无关二进制不得随功能改动进入 MR"
+  - "修改 proto、模型名、配置键、权重路径、TensorRT 版本或错误语义时，必须与 gvs 仓库的生成代码和调用方同步核对"
+
+  # C++ 语言通用规范
+  - "C++ 代码必须使用 C++17 标准，禁止使用过时的 C++98/03 特性"
+  - "优先使用 std::unique_ptr / std::shared_ptr 管理动态内存，禁止裸 new/delete（与第三方 C API 交互除外）"
+  - "CUDA 显存分配（cudaMalloc）必须配对 cudaFree，建议使用 RAII 包装类管理"
+  - "GStreamer 对象（GstElement*、GstPad* 等）必须配对 gst_object_unref/gst_element_set_state(NULL)，遵循 GLib 引用计数规则"
+  - "std::thread 必须在析构前 join 或 detach，禁止在析构时仍存在 joinable 的线程"
+  - "mutex 加锁范围应最小化，禁止在持有锁时进行 I/O、sleep 或长时间计算"
+  - "atomic 变量操作必须使用正确的 memory_order（默认 seq_cst 最安全，性能敏感场景显式指定）"
+  - "禁止在析构函数中调用虚函数，避免派生类已析构时访问纯虚函数"
+  - "异常安全：构造函数失败时应确保已分配资源被释放，遵循 RAII 原则"
+  - "禁止隐式类型转换导致的数据丢失，特别是 size_t <-> int、float <-> double 等窄化转换"
+  - "cv::Mat 从外部指针构造时（如 protobuf data），必须使用 .clone() 复制数据，避免悬空指针"
+  - "GStreamer buffer map 后必须 unmap，遵循 gst_buffer_map / gst_buffer_unmap 配对原则"
+  - "grpc::Server 使用 InsecureServerCredentials 仅在内部可信网络中允许，生产环境必须配置安全凭证"
+
+# ============================================================
+# 按 Agent 角色的专项规则
+# ============================================================
+agents:
+  # -------------------- architect（架构师） --------------------
+  architect:
+    - "检查 Model 基类设计是否合理：虚析构函数、纯虚接口（New/Detect/Close/GetModelType）、资源生命周期管理"
+    - "检查 ModelFactory 工厂模式是否正确注册和创建模型，避免类型字符串硬编码分散"
+    - "检查 ModelManager 单例模式是否线程安全，模型加载/卸载是否存在竞态条件"
+    - "检查 InferenceEngine 与 VideoStreamPipeline 的耦合度，回调机制（ResultCallback）是否清晰"
+    - "检查 Config 单例的线程安全性，配置加载失败时是否有合理的降级策略"
+    - "检查 gRPC 服务接口设计是否符合 protobuf 定义，请求/响应字段是否完整校验"
+    - "检查 GStreamer Pipeline 的构建模式：元素创建、链接、状态转换是否可维护"
+    - "检查 CUDA 显存管理策略：是否集中管理，避免分散的 cudaMalloc/cudaFree"
+    - "检查 streamer 模块的命名空间隔离：streamer namespace 下的类型是否与外部正确解耦"
+    - "检查 WorkMode 状态机设计：MODE_IDLE/MODE_TRACK/MODE_DETECT/MODE_DETECT_ONLY 转换是否完备"
+
+  # -------------------- security（安全） --------------------
+  security:
+    - "检查 cv::Mat 数据指针操作是否越界：从 protobuf 或 SHM 构造 Mat 时必须验证数据大小"
+    - "检查 GStreamer buffer 的 map/unmap 是否配对，防止内存访问越界"
+    - "检查 gRPC 请求参数校验：模型名、图像尺寸、GPU ID 等必须在有效范围内"
+    - "检查共享内存（SHM）读取是否验证数据大小，防止缓冲区溢出"
+    - "检查 CUDA kernel 调用前的数据校验，防止非法内存访问"
+    - "检查模型文件路径是否经过校验，防止路径遍历攻击"
+    - "检查 YAML 配置解析是否处理异常输入，防止解析器被恶意输入攻击"
+    - "检查 std::strncpy 等字符串操作是否正确处理边界，防止缓冲区溢出"
+    - "检查 gRPC 输入消息：protobuf repeated 字段长度是否有限制，防止 OOM"
+    - "检查 RTSP URL 是否来自可信来源，防止注入恶意流地址"
+
+  # -------------------- performance（性能） --------------------
+  performance:
+    - "检查 CUDA 显存分配是否在热路径上：推理循环中应避免重复的 cudaMalloc/cudaFree"
+    - "检查 cv::Mat clone() 的使用：热路径上不必要的 clone 会导致内存拷贝开销"
+    - "检查 GStreamer 队列配置：appsink/appsrc 的 max-buffers、drop、leaky 参数是否合理"
+    - "检查 InferenceEngine 的 frame_queue_ 深度：max_queue_size_=3 是否适合实时性要求"
+    - "检查模型推理是否异步化：Detect 调用是否阻塞 workerLoop 过长时间"
+    - "检查 RTMP 输出的编码参数：bitrate、关键帧间隔是否合理，避免码率波动"
+    - "检查 NV12 到 BGR 的颜色空间转换是否在 GPU 上进行（ENABLE_OPENCV_CUDA 宏控制）"
+    - "检查 std::lock_guard 的持有范围是否最小化，避免不必要的锁竞争"
+    - "检查 protobuf 消息序列化/反序列化是否可优化，避免大对象拷贝"
+    - "检查 GStreamer pipeline 的元素链接是否最优：避免不必要的格式转换"
+    - "检查 DEIMv2 双引擎推理：天空/地面模型的 CUDA 上下文切换是否有性能开销"
+    - "检查 workerLoop 线程的唤醒机制：condition_variable 通知是否及时，避免空转"
+
+  # -------------------- standard（开发规范） --------------------
+  standard:
+    - "检查命名规范：类名 PascalCase、函数名 camelCase、成员变量加下划线后缀或 m_ 前缀"
+    - "检查头文件是否使用 #pragma once 或 include guard"
+    - "检查 const 正确性：不修改的成员函数应标记 const，指针参数视情况用 const* 或 const&"
+    - "检查 explicit 构造函数：单参数构造函数应标记 explicit，防止隐式转换"
+    - "检查 override 关键字：重写虚函数必须标记 override"
+    - "检查 nullptr 使用：禁止用 NULL 或 0 表示空指针"
+    - "检查 auto 使用：auto 应提高可读性而非降低，复杂类型建议显式声明"
+    - "检查日志级别：错误用 SPDLOG_ERROR、警告用 SPDLOG_WARN、信息用 SPDLOG_INFO、调试用 SPDLOG_DEBUG"
+    - "检查 Timer 工具使用：推理函数应使用 Timer 统计耗时，便于性能分析"
+    - "检查 grpc::Status 返回：错误时必须设置合适的 StatusCode，成功返回 grpc::Status::OK"
+    - "检查条件编译宏：TRT_TAG、ENABLE_OPENCV_CUDA 等是否有清晰的文档说明"
+    - "检查 spdlog 日志格式：是否使用 {} 占位符而非 printf 风格，避免格式化异常"
+
+  # -------------------- test（测试） --------------------
+  test:
+    - "检查模型加载测试：--test-model 参数是否能正确验证所有模型"
+    - "基准测试成功必须进入测试判定与退出码；缺图、工具缺失、版本不匹配、CUDA/Detect 失败、样本不足或统计值无效不得仅显示 N/A 后仍返回成功"
+    - "基准测试需覆盖真实执行链路及失败路径；只测试计数、索引、统计等辅助函数，不能替代 SDK/trtexec 集成测试"
+    - "每个被报告的物理引擎延迟必须来自该引擎本身；复用其他引擎结果需要先证明内容与执行路径等价，并在报告中披露来源"
+    - "ground SDK（deimv2_ground）测速失败必须使整体测试失败并返回非零退出码；报告层不得把失败样本渲染为 [OK] 或 N/A 后仍输出整体成功"
+    - "检查内存泄漏测试：Valgrind 或 AddressSanitizer 是否通过"
+    - "检查 CUDA 错误处理测试：显存不足、模型文件缺失等异常场景"
+    - "检查 GStreamer pipeline 测试：EOS、错误恢复、重连等场景"
+    - "检查 gRPC 接口测试：边界参数、并发请求、错误码验证"
+    - "检查 --replay 模式的本地回放测试：MP4 文件推理结果是否正确"
+    - "检查模型推理精度测试：检测结果与预期是否一致（置信度、坐标）"
+
+  # -------------------- ai（AI算法） --------------------
+  ai:
+    - "检查模型初始化：New() 中是否正确加载引擎文件，处理 ALREADY_EXISTS 状态"
+    - "检查模型推理输入：图像数据是否从 protobuf MatData 或 SHM 正确读取，是否验证尺寸"
+    - "检查推理结果解析：YOLOv5/YOLOv26/DEIMv2/OSTrack/EfficientNet 的结果格式是否正确处理"
+    - "检查置信度过滤：是否按类别使用不同的置信度阈值（dnn_meta_.classes 中的 conf）"
+    - "检查坐标裁剪：检测框坐标是否限制在图像边界内，防止越界绘制"
+    - "检查跟踪器状态：OSTrack 的 TRACK_STATE_LOST 处理是否正确触发重检测"
+    - "检查 EfficientNet 分类器：ROI 裁剪和 padding 是否与 Go 侧实现一致"
+    - "检查 DEIMv2 双模型推理：天空/地面模型切换逻辑是否正确，纹理阈值是否合理"
+    - "检查模型资源释放：Close() 中是否正确释放 CUDA 显存和 TensorRT 上下文"
+    - "检查推理耗时统计：Timer 是否覆盖主要推理路径"
+    - "检查 NMS（非极大值抑制）参数：IOU 阈值设置是否合理，避免过度过滤或冗余框"
+    - "检查模型 resize 策略：letterbox vs stretch 是否按模型要求正确选择"
+
+  # -------------------- ui（接口/UI） --------------------
+  ui:
+    - "检查 gRPC 服务实现：InferServiceImpl 各 RPC 方法是否使用 SafeRpc 包装异常处理"
+    - "检查请求参数校验：模型名是否通过 GetModelRealName 解析，sub_name 是否合法"
+    - "检查 gRPC 响应：错误时是否返回合适的 StatusCode（NOT_FOUND/INVALID_ARGUMENT/INTERNAL）"
+    - "检查流式接口：TrackStream 和 OSDStream 是否正确处理连接生命周期"
+    - "检查 Connect 接口：版本信息、模型列表是否正确返回"
+    - "检查 SyncCameraList 接口：摄像头列表同步是否原子性更新，旧流是否正确停止"
+    - "检查 InitTrack 接口：protobuf 版本和直接指针版本的参数校验是否一致"
+    - "检查 SetWorkMode 接口：模式切换时是否正确处理 MODE_IDLE 到其他模式的转换"
+
+  # -------------------- ai_tool（AI工具） --------------------
+  ai_tool:
+    - "选择 trtexec 前必须探测其 TensorRT 主版本并与 engine 序列化版本匹配；TRTEXEC_PATH 和标准软链也不能绕过版本校验"
+    - "测速结果必须记录口径（warmup、样本数、median/P95、同步边界、输入 shape）；改变口径时同步更新文档和回归测试"
+    - "检查 TensorRT 引擎版本与模型权重的兼容性"
+    - "检查模型推理精度 vs 性能的权衡：FP16/INT8 量化是否适合当前场景"
+    - "检查模型 batch size 配置是否合理"
+    - "在合适场景给出 TensorRT 优化建议（如 layer fusion、workspace 调整）"
+
+  # -------------------- concurrency（并发） --------------------
+  concurrency:
+    - "检查 std::thread 生命周期：构造函数启动的线程是否在析构前正确 join/detach"
+    - "检查 std::mutex 使用：是否使用 std::lock_guard 或 std::unique_lock，避免裸 lock/unlock"
+    - "检查死锁风险：是否同时持有多个锁，加锁顺序是否一致"
+    - "检查 atomic 变量：InferenceEngine 中的 running_、current_mode_ 等是否使用正确的 memory_order"
+    - "检查 condition_variable 使用：wait 是否使用谓词防止虚假唤醒，notify 是否在锁内调用"
+    - "检查回调线程安全：InferenceEngine::setResultCallback 是否在多线程环境下安全"
+    - "检查 StreamManager 的 syncCameraList：旧流停止和新流创建是否在锁外进行，避免死锁"
+    - "检查 GStreamer 的 GST_PAD_PROBE 回调：是否线程安全，是否可能阻塞 pipeline"
+    - "检查 RtspInput 的重连线程：reconnecting_ atomic 标志是否正确防止并发重连"
+    - "检查 RtmpOutput 的 reconnectLoop：needs_reconnect_ 和 initialized_ 的状态转换是否正确"
+    - "检查 workerLoop 退出：running_ 设为 false 后，condition_variable 是否正确通知唤醒"
+    - "检查 GStreamer 主循环线程：g_main_loop_run 是否在独立线程中运行，quit 是否从正确线程调用"
+
+  # -------------------- resource（资源） --------------------
+  resource:
+    - "检查 CUDA 显存：cudaMalloc 必须配对 cudaFree，Deimv2Model 的 d_image_/d_size_ 是否在 Close 中释放"
+    - "检查 GStreamer 对象生命周期：GstElement*、GstPad*、GstSample*、GstBuffer* 是否正确 unref"
+    - "检查 cv::Mat 内存：从 GStreamer buffer 构造的 Mat 是否仅作为视图使用，不额外管理内存"
+    - "检查模型资源：Yolov5Model::dnn_、OSTrackModel::track_ 等是否在 Close 中正确释放"
+    - "检查线程资源：VideoStreamPipeline 的 pipeline_thread_ 和 worker_thread_ 是否在 stop 中 join"
+    - "检查 g_main_loop 资源：是否配对 g_main_loop_new / g_main_loop_unref / g_main_loop_quit"
+    - "检查 GstBus watch：bus_watch_source_ 是否在 stop 中 g_source_destroy"
+    - "检查文件输出：FileOutput 的 EOS 是否正确发送，文件是否正确关闭"
+    - "检查共享内存：ShmUtils::ReadImageFromShm 返回的 Mat 是否正确处理"
+    - "检查 protobuf 消息：mutable_xxx 获取的指针是否检查非空后再使用"
+    - "检查 VideoStreamPipeline::stop 释放顺序：inference→queue→mainloop→threads→outputs→inputs→pipeline"
+    - "检查 TensorRT context：cuda::ExecutionContext 是否在模型 Close 时正确销毁"
+
+  # -------------------- dataflow（数据流） --------------------
+  dataflow:
+    - "检查 InferenceEngine 的 frame_queue_：FrameTask 中的 cv::Mat 是否通过 clone 确保数据独立"
+    - "检查 VideoStreamPipeline 的 onNewSample：GstSample 是否正确 ref/unref，避免内存泄漏"
+    - "检查 processFrames 中的 gst_buffer_map/unmap 是否严格配对"
+    - "检查 InferenceResult 的帧数据：raw_frame、overlay_frame、zoom_frame 的生命周期是否清晰"
+    - "检查 RTMP 推流路径：BGR 到 NV12 的转换是否正确，帧数据是否正确推送到 appsrc"
+    - "检查 OSD 数据流：OSDItem 从 protobuf 到 cv::Mat 的绘制是否正确处理坐标和颜色"
+    - "检查模型输入数据流：protobuf MatData 到 cv::Mat 的转换是否验证数据完整性"
+    - "检查跟踪结果数据流：TrackDetection 中的 rect/track_rect/predict_rect/search_rect 是否正确传递"
+    - "检查 pushFrame 丢帧策略：队列满时丢弃最旧帧是否保证实时性"
+    - "检查 OSD 反馈机制：sequence_id 确认 + kMaxPendingFrames 强制发送是否防止积压"
+
+# ============================================================
+# 路径级规则：diff 中包含匹配路径时追加对应规则
+# ============================================================
+paths:
+  - pattern: "gvs_infer/streamer/**"
+    rules:
+      - "GStreamer 元素创建后必须检查非空，失败时抛出异常或返回错误"
+      - "gst_element_link_many 失败时必须正确处理，避免 pipeline 处于不一致状态"
+      - "动态添加元素到运行中的 pipeline 时，必须先 gst_element_set_locked_state(TRUE)"
+      - "probe 回调中禁止执行阻塞操作，避免阻塞 GStreamer pipeline"
+      - "GstSample/GstBuffer 的 ref/unref 必须严格配对"
+      - "appsink 配置：emit-signals=TRUE, sync=FALSE, drop=TRUE, max-buffers=1 以保证低延迟"
+      - "appsrc 配置：is-live=TRUE, block=FALSE, max-bytes 按帧大小设置"
+      - "RTSP 输入重连：指数退避策略是否有上限，避免无限等待"
+      - "RTMP 输出重连：resetSink 中 flush→force key unit→push TIME segment 顺序是否正确"
+      - "延迟监控：probe 点（decoder entry/sink/exit、convert exit）是否覆盖关键路径"
+
+  - pattern: "gvs_infer/*_model.cpp"
+    rules:
+      - "模型 New() 中必须检查引擎文件是否存在，避免加载空文件导致 TRT 异常"
+      - "模型 Detect() 中必须加锁保护，防止并发推理导致 CUDA 上下文错误"
+      - "模型 Close() 中必须释放所有资源，包括 CUDA 显存和第三方库句柄"
+      - "从 protobuf 构造 cv::Mat 时必须使用 .clone()，避免悬空指针"
+      - "推理结果必须验证非空后再访问，防止空指针解引用"
+      - "Timer 必须覆盖 Detect 等主要推理函数"
+      - "YOLOv5 模型：Yolov5Destroy 后必须将 dnn_ 置为 nullptr"
+      - "DEIMv2 模型：trt10 条件编译下双引擎加载（sky + ground）的显存管理是否正确"
+      - "OSTrack 模型：InitTrack 的两种重载（protobuf/指针）参数校验是否一致"
+      - "EfficientNet 模型：LoadMeta 解析 JSON 和 LoadDroneTypeMap 类别映射是否正确处理异常"
+
+  - pattern: "gvs_infer/infer_service_impl.cpp"
+    rules:
+      - "所有 RPC 方法必须使用 SafeRpc 包装，捕获 std::exception 和 (...)"
+      - "模型查找失败时必须返回 grpc::StatusCode::NOT_FOUND"
+      - "dynamic_pointer_cast 失败后必须返回错误，不要静默忽略"
+      - "SyncCameraList 中原子性：旧流停止和新流创建必须避免中间状态"
+      - "TrackStream/OSDStream 流式接口必须正确处理客户端断开连接"
+      - "StopTrack 必须等待跟踪线程完全停止后再返回"
+
+  - pattern: "gvs_infer/config.cpp"
+    rules:
+      - "YAML 解析异常必须捕获：BadFile、ParserException、Exception、std::exception"
+      - "配置加载失败时必须有降级策略（使用默认值）"
+      - "GetOrWarn 模板函数应正确处理类型转换失败"
+      - "模型路径拼接必须使用 GetModelPathFromType，避免硬编码路径"
+      - "set_model 默认配置中的输入尺寸、resize、overlap、置信度/IOU 阈值是否合理"
+      - "GetModelRealName 模型名映射是否覆盖所有支持的模型类型"
+
+  - pattern: "gvs_infer/main.cpp"
+    rules:
+      - "gRPC ServerBuilder 必须设置 ResourceQuota 限制线程数，防止线程膨胀"
+      - "必须检查 selected_port 确认绑定成功，端口被占用时优雅退出"
+      - "GStreamer 初始化后必须设置 gst_debug_add_log_function 适配 spdlog"
+      - "模型初始化顺序：InitModelFactory -> InitGstreamer -> InitModelInfo -> InitCudaBuf"
+      - "replay 模式结束时必须显式释放模型，避免静态析构时 CUDA driver 已卸载"
+      - "SO_REUSEPORT=0 设置是否正确，避免端口复用导致的安全问题"
+      - "keepalive 参数配置是否合理，防止长时间空闲连接占用资源"
+
+  - pattern: "gvs_infer/CMakeLists.txt"
+    rules:
+      - "find_library 必须设置 REQUIRED，确保依赖库存在"
+      - "TRT_TAG 宏定义必须与 TensorRT 版本匹配，默认 trt8 需确认兼容性"
+      - "链接库顺序：依赖库在前，系统库在后（cudart、pthread 等）"
+      - "Debug 模式下必须启用 AddressSanitizer（-fsanitize=address）"
+      - "CUDA 架构设置（-gencode）是否覆盖目标 GPU 型号"
+      - "TRT_TAG 与库名绑定（cucodes_${TRT_TAG}/yolov5_det_${TRT_TAG}/enet_classifier_${TRT_TAG}/ostrack_${TRT_TAG}），切换主版本时必须全链路核对"
+
+  - pattern: "gvs_infer/test_model/**"
+    rules:
+      - "ground SDK（deimv2_ground）测速失败必须使整体测试失败并返回非零退出码；报告层不得把失败样本显示为 [OK] 或 N/A 后仍判定通过"
+      - "CTest/gtest 目标必须链接真实 benchmark 源码并覆盖真实 Detect/CUDA 执行链路；只测计数、索引、统计等辅助函数不构成覆盖"
+      - "每个被报告的物理引擎延迟必须来自该引擎本身；复用 drone.engine 等其他引擎结果需先证明执行路径等价并在报告中披露来源"
+      - "新增测试图片、权重或二进制必须说明来源、用途与许可证；无关二进制不得随功能改动进入 MR"
+      - "测速口径（warmup、样本数、median/P95、同步边界、输入 shape）变更必须同步更新 testset/Readme.md 与 TECHNICAL.md 及回归测试"
+      - "选择 trtexec 前必须探测其 TensorRT 主版本并与 engine 序列化版本匹配；TRTEXEC_PATH 与标准软链也不能绕过版本校验"
+
+  - pattern: "gvs_infer/shm_utils.*"
+    rules:
+      - "共享内存打开后必须在使用完毕后关闭，防止 fd 泄漏"
+      - "mmap 映射后必须配对 munmap"
+      - "读取共享内存中的图像数据时必须验证尺寸和格式"
+
+  - pattern: "gvs_infer/proto/**"
+    rules:
+      - "protobuf 字段编号变更后必须确认与客户端兼容"
+      - "repeated 字段必须考虑最大长度限制，防止恶意大量数据"
+      - "oneof 字段必须处理未设置的情况"

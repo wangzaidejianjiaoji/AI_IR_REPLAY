@@ -1,0 +1,87 @@
+# config.mock.yaml — 冒烟测试配置：LLM 指向本地 Mock 服务，Dry-Run 只输出评论
+scheduler:
+  interval: "30m"
+  jitter: "0s"
+
+github:
+  api_base: "https://api.github.com"
+  token: ""
+  repos:
+    - owner: "local"
+      repo: "test"
+
+llm:
+  provider: "mock"
+  api_key: "mock-key"
+  base_url: "http://127.0.0.1:19090"
+  models:
+    small: "mock-8k"
+    medium: "mock-32k"
+    large: "mock-128k"
+  model_thresholds:
+    small: 500
+    medium: 3000
+  timeout: "10s"
+  max_tokens: 4000
+  temperature: 0.3
+  retry:
+    max_attempts: 2
+    base_delay: "1s"
+    max_delay: "5s"
+
+agents:
+  architect:   { enabled: true, priority: 1 }
+  security:    { enabled: true, priority: 1 }
+  performance: { enabled: true, priority: 1 }
+  standard:    { enabled: true, priority: 2 }
+  test:        { enabled: true, priority: 2 }
+  ai:          { enabled: true, priority: 2 }
+  ui:          { enabled: true, priority: 2 }
+  ai_tool:     { enabled: true, priority: 2 }
+  concurrency: { enabled: true, priority: 1 }
+  resource:    { enabled: true, priority: 1 }
+  dataflow:    { enabled: true, priority: 1 }
+
+review:
+  max_llm_calls: 100
+  max_round_tokens: 1000000
+  round_timeout: "20m"
+  max_round_cost: 0 # Set only with verified llm.prices in a single currency
+  dry_run: true
+  max_diff_chars: 60000
+  max_agent_concurrency: 4
+  max_files_per_review: 20
+  file_packaging:
+    enabled: true
+    max_package_size: 5
+  comment_location:
+    enabled: true
+    verify_line_number: true
+  comment_reflection:
+    enabled: true
+    check_hallucination: true
+  include_paths: []
+  exclude_paths:
+    - "**/vendor/**"
+    - "**/*_test.go"
+    - "**/*.md"
+
+rules:
+  project_path: "./configs/review-rules-gvs.yaml"
+  hot_reload: true
+  reload_interval: "5s"
+
+notification:
+  pr_comment: false               # 禁用评论发布，审查报告输出到日志
+  mention_author: true
+  mention_reviewers: true
+  max_issues_display: 10
+
+logging:
+  level: "info"
+  format: "gvs"
+  output: "stdout"
+
+server:
+  admin_token: "${AGENT_ADMIN_TOKEN}"
+  addr: "127.0.0.1:18081"

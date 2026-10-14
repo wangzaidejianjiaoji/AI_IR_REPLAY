@@ -1,0 +1,30 @@
+services:
+  pr-agent:
+    build: .
+    container_name: gvs-pr-agent
+    restart: unless-stopped
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - KIMI_API_KEY=${KIMI_API_KEY}
+      - CODEUP_ORG_ID=${CODEUP_ORG_ID}
+      - CODEUP_TOKEN=${CODEUP_TOKEN}
+      - AGENT_ADMIN_TOKEN=${AGENT_ADMIN_TOKEN:?Set an admin token before starting Compose}
+      - AGENT_SERVER_ADDR=0.0.0.0:8081
+      - AGENT_CONFIG_PATH=${AGENT_CONFIG_PATH:-/app/configs/config.yaml}
+      - AGENT_LOG_LEVEL=${AGENT_LOG_LEVEL:-info}
+      - AGENT_REVIEW_DRY_RUN=${AGENT_REVIEW_DRY_RUN:-true}
+    ports:
+      - "127.0.0.1:8081:8081" # container config must bind 0.0.0.0:8081 and set admin token
+    volumes:
+      - ./configs:/app/configs:ro
+      - ./data:/app/data
+      - ./docs:/app/docs
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M

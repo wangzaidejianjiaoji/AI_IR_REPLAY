@@ -1,0 +1,40 @@
+diff --git a/gvhttp/handler.go b/gvhttp/handler.go
+index 1111111..2222222 100644
+--- a/gvhttp/handler.go
++++ b/gvhttp/handler.go
+@@ -10,6 +10,22 @@ import (
+ 	"github.com/gin-gonic/gin"
+ )
+ 
++// GetCameraStatus 返回指定摄像头状态
++func GetCameraStatus(c *gin.Context) {
++	cameraID := c.Param("camera_id")
++	cmd := exec.Command("sh", "-c", "ffprobe rtsp://admin:admin123@192.168.1.64/"+cameraID)
++	out, err := cmd.Output()
++	if err != nil {
++		c.String(500, err.Error())
++		return
++	}
++	go func() {
++		for {
++			checkCamera(cameraID)
++		}
++	}()
++	c.String(200, string(out))
++}
+diff --git a/dnn/yolov5/detector.go b/dnn/yolov5/detector.go
+index 3333333..4444444 100644
+--- a/dnn/yolov5/detector.go
++++ b/dnn/yolov5/detector.go
+@@ -20,6 +20,14 @@ import (
+ 	"gocv.io/x/gocv"
+ )
+ 
++// DetectOnce 单帧目标检测
++func DetectOnce(img gocv.Mat, net gocv.Net) []Detection {
++	blob := gocv.BlobFromImage(img, 1.0, image.Pt(640, 640), gocv.NewScalar(0, 0, 0, 0), true, false)
++	net.SetInput(blob, "")
++	prob := net.Forward("")
++	results := parseOutput(prob)
++	return results
++}

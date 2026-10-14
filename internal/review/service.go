@@ -1,0 +1,736 @@
+// Package review 实现审查主流程：
+// PR 发现 -> Commit SHA 去重 -> diff 获取与解析 -> 文件筛选 -> 智能文件打包
+// -> 规则匹配（四层链，热更新）-> 多 Agent 并行审查 -> 评论定位 -> 评论反思/去重
+// -> 统一评论生成（demo 模式下评论发布被禁用，审查报告输出到日志）。
+//
+// 除 PR 审查外，还支持 Codeup 分支推送审查：轮询分支 HEAD 变化，
+// 对新提交做增量 diff 审查（基线持久化到本地），结果回写为 commit 评论。
+package review
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"gvs-pr-agent/internal/agent"
+	"gvs-pr-agent/internal/analyzer"
+	"gvs-pr-agent/internal/codeup"
+	"gvs-pr-agent/internal/config"
+	"gvs-pr-agent/internal/coordinator"
+	"gvs-pr-agent/internal/diff"
+	"gvs-pr-agent/internal/filter"
+	"gvs-pr-agent/internal/github"
+	"gvs-pr-agent/internal/llm"
+	"gvs-pr-agent/internal/locator"
+	"gvs-pr-agent/internal/notifier"
+	"gvs-pr-agent/internal/packager"
+	"gvs-pr-agent/internal/reflector"
+	"gvs-pr-agent/internal/rules"
+	"gvs-pr-agent/internal/state"
+	"gvs-pr-agent/internal/textbudget"
+	"gvs-pr-agent/internal/understanding"
+)
+
+// conflictTracker 跟踪已知冲突的 PR/MR，避免重复打印日志。
+// 进程重启后清空，首次遇到冲突时会打印日志，后续轮询静默跳过。
+type conflictTracker struct {
+	mu        sync.Mutex
+	conflicts map[string]struct{} // key: "github:{repo}:{pr}" 或 "codeup:{repo}:{mr}"
+}
+
+// mark 标记某个 PR/MR 为已知冲突。返回 true 表示是首次记录（应打印日志）。
+func (ct *conflictTracker) mark(key string) bool {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	if ct.conflicts == nil {
+		ct.conflicts = make(map[string]struct{})
+	}
+	if _, ok := ct.conflicts[key]; ok {
+		return false // 已记录过，静默
+	}
+	ct.conflicts[key] = struct{}{}
+	return true // 首次记录，应打印日志
+}
+
+// clear 清除指定 key 的记录（冲突解决后调用）。
+func (ct *conflictTracker) clear(key string) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+	delete(ct.conflicts, key)
+}
+
+// Service 审查服务。
+type Service struct {
+	cfg        *config.Config
+	gh         *github.Client
+	cu         *codeup.Client // Codeup 客户端（分支推送审查，未启用时为 nil）
+	branchSt   *state.Store   // 分支审查基线存储（未启用时为 nil）
+	llm        *llm.Client
+	coord      *coordinator.Coordinator
+	analyzer   *analyzer.Analyzer
+	knowledge  *understanding.Manager
+	rulesStore *rules.Store
+	logger     *slog.Logger
+	tz         *time.Location
+	conflictTr *conflictTracker // 冲突 PR/MR 日志去重跟踪器
+}
+
+// NewService 组装审查服务的全部依赖。
+// cliRulePath 为 CLI -rule 参数指定的规则文档（四层优先级链的最高层，可为空）。
+func NewService(cfg *config.Config, cliRulePath string, logger *slog.Logger) (*Service, error) {
+	if err := cfg.ValidateRuntime(); err != nil {
+		return nil, err
+	}
+	// 【四层规则优先级链】CLI -rule > 项目配置 > 全局配置 > 内嵌默认
+	rulesStore, err := rules.NewStore(cliRulePath, cfg.Rules.ProjectPath, cfg.Rules.GlobalPath, logger)
+	if err != nil {
+		return nil, err
+	}
+	logger.Info("规则文档已加载", "source", rulesStore.Source(),
+		"version", rulesStore.Current().Version)
+
+	llmClient := llm.New(cfg.LLM, logger)
+	agents := agent.BuildEnabled(cfg.Agents, llmClient, logger)
+	if len(agents) == 0 {
+		return nil, fmt.Errorf("没有启用任何 Agent，请检查配置 agents 段")
+	}
+	logger.Info("已启用 Agent", "count", len(agents), "roles", roleNames(agents))
+
+	// 【确定性工程】评论定位器与评论反思器（按配置开关装配）
+	var loc *locator.Locator
+	if cfg.Review.CommentLocation.Enabled {
+		loc = locator.New(cfg.Review.CommentLocation.VerifyLineNumber, logger)
+	}
+	var refl *reflector.Reflector
+	if cfg.Review.CommentReflection.Enabled {
+		refl = reflector.New(cfg.Review.CommentReflection.CheckHallucination, logger)
+	}
+
+	// 显式使用上海时区（跨平台部署时不依赖系统时区）
+	tz, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		tz = time.Local
+	}
+
+	// Codeup 分支推送审查（可选）：客户端 + 分支基线存储
+	var cu *codeup.Client
+	var branchSt *state.Store
+	if cfg.Codeup.Enabled {
+		cu = codeup.New(cfg.Codeup.Domain, cfg.Codeup.OrganizationID, cfg.Codeup.Token, cfg.Codeup.PerPage)
+		branchSt, err = state.Open(cfg.Codeup.StatePath)
+		if err != nil {
+			return nil, fmt.Errorf("加载分支审查基线: %w", err)
+		}
+		logger.Info("分支推送审查已启用", "repos", len(cfg.Codeup.Repos),
+			"state_path", cfg.Codeup.StatePath)
+	}
+
+	var changeAnalyzer *analyzer.Analyzer
+	var knowledgeManager *understanding.Manager
+	var confirmer *coordinator.Confirmer
+	if cfg.Understanding.Enabled {
+		var seed string
+		if cfg.Understanding.SeedPath != "" {
+			raw, readErr := os.ReadFile(cfg.Understanding.SeedPath)
+			if readErr != nil {
+				if cfg.Understanding.Strict {
+					return nil, fmt.Errorf("读取全局理解初始化材料: %w", readErr)
+				}
+				logger.Warn("全局理解初始化材料不可用，将使用现有本地理解文档", "error", readErr.Error())
+			} else {
+				seed = string(raw)
+			}
+		}
+		changeAnalyzer = analyzer.New(llmClient)
+		knowledgeManager = understanding.New(cfg.Understanding, cu, llmClient, seed, logger)
+		confirmer = coordinator.NewConfirmer(llmClient)
+	}
+
+	return &Service{
+		cfg:        cfg,
+		gh:         github.New(cfg.GitHub.APIBase, cfg.GitHub.Token, cfg.GitHub.PerPage),
+		cu:         cu,
+		branchSt:   branchSt,
+		llm:        llmClient,
+		coord:      coordinator.New(agents, cfg.Review.MaxAgentConcurrency, loc, refl, logger, confirmer),
+		analyzer:   changeAnalyzer,
+		knowledge:  knowledgeManager,
+		rulesStore: rulesStore,
+		logger:     logger,
+		tz:         tz,
+		conflictTr: &conflictTracker{},
+	}, nil
+}
+
+// StartRuleHotReload 启动规则文档热更新轮询（rules.hot_reload 开启时）。
+func (s *Service) StartRuleHotReload(stop <-chan struct{}) {
+	if s.cfg.Rules.HotReload {
+		s.rulesStore.StartHotReload(s.cfg.Rules.ReloadIntervalDuration(), stop)
+	}
+}
+
+// RunOnce 执行一轮审查：遍历所有配置仓库的 Open PR，再扫描 Codeup 分支推送。
+func (s *Service) RunOnce(ctx context.Context) {
+	ctx, cancel := s.roundContext(ctx)
+	defer cancel()
+	// 【审查时间窗口】非工作时段跳过本轮（与 GVS 日夜模式对应）
+	if !s.cfg.Review.InActiveHours(time.Now()) {
+		s.logger.Info("当前不在审查时间窗口内，跳过本轮",
+			"start", s.cfg.Review.ActiveHours.Start, "end", s.cfg.Review.ActiveHours.End)
+		return
+	}
+	for _, repo := range s.cfg.GitHub.Repos {
+		if err := s.reviewRepo(ctx, repo); err != nil {
+			s.logger.Error("仓库审查失败", "repo", repo.Owner+"/"+repo.Repo, "error", err.Error())
+		}
+	}
+	// 【分支推送审查】扫描 Codeup 仓库分支 HEAD 变化，增量审查新提交
+	if s.cu != nil {
+		for _, repo := range s.cfg.Codeup.Repos {
+			if err := s.reviewCodeupRepo(ctx, repo); err != nil {
+				s.logger.Error("分支推送审查失败", "repo", repo.DisplayName(), "error", err.Error())
+			}
+			// 【MR 审查】扫描 Codeup 开启状态的合并请求（新版本未审时触发）
+			if s.cfg.Codeup.MRReview {
+				if err := s.reviewCodeupMRs(ctx, repo); err != nil {
+					s.logger.Error("MR 审查失败", "repo", repo.DisplayName(), "error", err.Error())
+				}
+			}
+		}
+	}
+}
+
+// reviewRepo 审查单个仓库的所有符合条件的 Open PR。
+func (s *Service) reviewRepo(ctx context.Context, repo config.RepoConfig) error {
+	full := repo.Owner + "/" + repo.Repo
+	prs, err := s.gh.ListOpenPRs(ctx, repo.Owner, repo.Repo)
+	if err != nil {
+		return err
+	}
+	s.logger.Info("获取 Open PR 列表", "repo", full, "count", len(prs))
+
+	for _, pr := range prs {
+		key := fmt.Sprintf("github:%s:%d", full, pr.Number)
+		// 【WIP 检测】开发中的 PR 暂不审查，移除 WIP 前缀后自动进入审查
+		if pr.IsWIP() {
+			s.logger.Debug("跳过 PR：开发中（WIP）", "pr", pr.Number, "title", pr.Title)
+			continue
+		}
+		// 【合并冲突检测】存在冲突的 PR 无法生成 diff，跳过以节省 API 与 LLM 配额
+		if pr.HasConflict() {
+			if s.conflictTr.mark(key) {
+				s.logger.Info("跳过 PR：存在合并冲突，等待开发者解决后自动重审",
+					"pr", pr.Number, "mergeable_state", pr.MergeableState)
+			}
+			continue
+		}
+		// PR 无冲突时，清除冲突跟踪记录（防止冲突解决后重新冲突时漏打日志）
+		s.conflictTr.clear(key)
+		// 目标分支过滤
+		if !filter.MatchBranch(pr.Base.Ref, repo.BranchFilter.Include, repo.BranchFilter.Exclude) {
+			s.logger.Debug("跳过 PR：目标分支不匹配", "pr", pr.Number, "base", pr.Base.Ref)
+			continue
+		}
+		if err := s.reviewPR(ctx, repo, pr); err != nil {
+			s.logger.Error("PR 审查失败", "repo", full, "pr", pr.Number, "error", err.Error())
+		}
+	}
+	return nil
+}
+
+// reviewPR 审查单个 PR。
+func (s *Service) reviewPR(ctx context.Context, repo config.RepoConfig, pr *github.PullRequest) error {
+	full := repo.Owner + "/" + repo.Repo
+	log := s.logger.With("repo", full, "pr", pr.Number, "sha", short(pr.Head.SHA))
+
+	// 【第一层去重】检查是否已有该 Commit SHA 的审查存证
+	comments, err := s.gh.ListComments(ctx, repo.Owner, repo.Repo, pr.Number)
+	if err != nil {
+		return err
+	}
+	marker := notifier.Marker(pr.Head.SHA)
+	for _, c := range comments {
+		if strings.Contains(c.Body, marker) {
+			log.Debug("跳过 PR：该 Commit 已审查")
+			return nil
+		}
+	}
+
+	// 获取并解析 diff
+	rawDiff, err := s.gh.GetPRDiff(ctx, repo.Owner, repo.Repo, pr.Number)
+	if err != nil {
+		// 兜底：区分"合并冲突"与其他错误，避免冲突 PR 反复报错
+		if strings.Contains(err.Error(), "合并冲突") {
+			key := fmt.Sprintf("github:%s:%d", full, pr.Number)
+			if s.conflictTr.mark(key) {
+				log.Info("跳过 PR：存在合并冲突，等待开发者解决后自动重审", "error", err.Error())
+			}
+			return nil
+		}
+		return err
+	}
+
+	summary, err := s.reviewDiff(ctx, rawDiff, full, pr.Title, pr.Body, log)
+	if err != nil || summary == nil {
+		return err
+	}
+
+	// 生成统一评论
+	body := notifier.BuildComment(*summary, notifier.Options{
+		MentionAuthor:    s.cfg.Notification.MentionAuthor,
+		MentionReviewers: s.cfg.Notification.MentionReviewers,
+		MaxIssuesDisplay: s.cfg.Notification.MaxIssuesDisplay,
+		Author:           pr.User.Login,
+		Reviewers:        pr.Reviewers(),
+		CommitSHA:        pr.Head.SHA,
+		Timezone:         s.tz,
+	})
+
+	// 【评论发布开关】demo 模式禁用发布：审查报告只输出到日志
+	if !s.cfg.Notification.PRComment || s.cfg.Review.DryRun {
+		log.Info("评论发布已禁用（模拟审查），审查报告如下",
+			"issues", len(summary.Issues), "report", body)
+		return nil
+	}
+	if err := s.gh.PostComment(ctx, repo.Owner, repo.Repo, pr.Number, body); err != nil {
+		return err
+	}
+	log.Info("评论已发布")
+	return nil
+}
+
+// reviewDiff 审查流程公共段：解析 -> 筛选 -> 打包 -> 多 Agent 审查 -> 定位/反思汇总。
+// 筛选后无文件时返回 (nil, nil)。
+func (s *Service) reviewDiff(ctx context.Context, rawDiff, repoFullName, title, body string,
+	log *slog.Logger) (*coordinator.Summary, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	allFiles := diff.Parse(rawDiff)
+
+	// 【确定性工程】文件筛选
+	files := filter.Files(allFiles, s.cfg.Review.IncludePaths, s.cfg.Review.ExcludePaths)
+	if len(files) == 0 {
+		log.Info("跳过：筛选后无待审查文件", "total_files", len(allFiles))
+		return nil, nil
+	}
+	totalFiltered := len(files) // 筛选后总数（超限截断前，报告披露用）
+	if len(files) > s.cfg.Review.MaxFilesPerReview {
+		return nil, fmt.Errorf("审查覆盖不完整：筛选后有 %d 个文件，超过 max_files_per_review=%d；请拆分变更或提高上限后重新执行",
+			len(files), s.cfg.Review.MaxFilesPerReview)
+	}
+
+	// 【确定性工程】智能文件打包：关联文件归并为审查包，上下文隔离
+	var pkgs []packager.Package
+	if s.cfg.Review.FilePackaging.Enabled {
+		pkgs = packager.Pack(files, s.cfg.Review.FilePackaging.MaxPackageSize)
+	} else {
+		pkgs = []packager.Package{{Name: "全部变更", Files: files}}
+	}
+	var pkgNames []string
+	for i := range pkgs {
+		pkgNames = append(pkgNames, fmt.Sprintf("%s(%d文件)", pkgs[i].Name, len(pkgs[i].Files)))
+	}
+
+	// 【模型分级】按变更总行数选择模型
+	changed := diff.TotalChangedLines(files)
+	model := s.llm.SelectModel(changed)
+	log.Info("开始审查", "title", title, "files", len(files), "packages", strings.Join(pkgNames, "、"),
+		"changed_lines", changed, "model", model)
+
+	var (
+		changeContext   analyzer.ChangeContext
+		analysisUsage   llm.Usage
+		knowledgeUsage  llm.Usage
+		knowledgeSHA    string
+		knowledgeStatus = "未启用"
+	)
+	if s.analyzer != nil {
+		var globalDocument string
+		if s.knowledge != nil {
+			snapshot, usage, prepareErr := s.knowledge.Prepare(ctx, model)
+			knowledgeUsage = usage
+			if prepareErr != nil {
+				knowledgeStatus = "降级：" + prepareErr.Error()
+				if s.cfg.Understanding.Strict {
+					return nil, prepareErr
+				}
+				globalDocument, knowledgeSHA = snapshot.Document, snapshot.SourceSHA
+				log.Warn("本地全局理解更新失败，使用已标注版本的旧快照（若有）", "source_sha", knowledgeSHA, "error", prepareErr.Error())
+			} else {
+				globalDocument = snapshot.Document
+				knowledgeSHA = snapshot.SourceSHA
+				if snapshot.Updated {
+					knowledgeStatus = "已同步"
+				} else {
+					knowledgeStatus = "已复用最新版本"
+				}
+			}
+		}
+		var analyzeErr error
+		changeContext, analysisUsage, analyzeErr = s.analyzer.Analyze(ctx, analyzer.Input{
+			Repository: repoFullName, Title: title, Body: body,
+			Diff: analysisDiff(files, s.cfg.Review.MaxDiffChars), GlobalUnderstanding: globalDocument, Model: model,
+		})
+		if analyzeErr != nil {
+			return nil, analyzeErr
+		}
+	}
+	changeJSON, _ := json.Marshal(changeContext)
+	base := agent.Task{
+		RepoFullName:  repoFullName,
+		PRTitle:       title,
+		PRBody:        body,
+		ChangeContext: string(changeJSON),
+		Model:         model,
+	}
+
+	// 多 Agent 并行审查（按包 × 角色分发）+ 定位 + 反思去重
+	doc := s.rulesStore.Current()
+	summary := s.coord.Run(ctx, base, pkgs, func(role string, pkgFiles []*diff.FileDiff) []string {
+		return doc.ForAgent(role, pkgFiles)
+	}, files, coordinator.Options{
+		MaxDiffChars: s.cfg.Review.MaxDiffChars,
+		AssignAgents: s.cfg.Review.FilePackaging.Enabled,
+	})
+	summary.TotalFiles, summary.Reviewed = totalFiltered, len(files) // 超限截断披露
+	summary.AnalysisTotalBytes = len(analysisDiff(files, 0))
+	if s.analyzer != nil {
+		summary.AnalysisReviewedBytes = len(textbudget.Limit(analysisDiff(files, 0), s.cfg.Review.MaxDiffChars))
+	}
+	summary.ChangeSummary = changeContext.Summary
+	if changeContext.Intent != "" {
+		summary.ChangeSummary += "\n\n**变更意图：** " + changeContext.Intent
+	}
+	summary.VerificationOverview = fmt.Sprintf("全局理解文档：%s", knowledgeStatus)
+	if knowledgeSHA != "" {
+		// 知识库跟踪目标仓库默认分支（main）；knowledgeRepo 取仓库名最后一段，
+		// 避免多仓库共用时把 gvs_infer 误标为 gvs（本地模式显示 local）。
+		knowledgeRepo := repoFullName
+		if knowledgeRepo == "local/diff" {
+			knowledgeRepo = "local"
+		} else if i := strings.LastIndex(knowledgeRepo, "/"); i >= 0 {
+			knowledgeRepo = knowledgeRepo[i+1:]
+		}
+		summary.VerificationOverview += fmt.Sprintf("（%s/main `%s`）", knowledgeRepo, short(knowledgeSHA))
+	}
+	summary.VerificationOverview += fmt.Sprintf("；纳入 %d/%d 个文件（不等于全文覆盖）；作业成功 %d/失败 %d；角色全部成功 %d/部分失败 %d/全部失败 %d；定位/反思过滤 %d 个候选。",
+		summary.Reviewed, summary.TotalFiles, summary.SuccessfulJobs, summary.FailedJobs, summary.FullySuccessfulRoles, summary.PartiallyFailedRoles, summary.FullyFailedRoles, summary.Dropped)
+	summary.TotalUsage.PromptTokens += knowledgeUsage.PromptTokens + analysisUsage.PromptTokens
+	summary.TotalUsage.CompletionTokens += knowledgeUsage.CompletionTokens + analysisUsage.CompletionTokens
+	summary.TotalUsage.TotalTokens += knowledgeUsage.TotalTokens + analysisUsage.TotalTokens
+
+	log.Info("审查完成", "issues", len(summary.Issues), "dropped", summary.Dropped,
+		"failed_agents", summary.FailedRoles, "total_tokens", summary.TotalUsage.TotalTokens)
+
+	// 【失败拦截】所有审查任务均失败（如 LLM 认证/网络故障）：
+	// 结果不可信，返回错误让调用方不发评论、不推进去重基线，下轮重试
+	if summary.AllFailed {
+		return nil, fmt.Errorf("全部 Agent 审查失败（%s），放弃本次结果",
+			strings.Join(summary.FailedRoles, "、"))
+	}
+	if summary.ConfirmationError != "" {
+		return nil, fmt.Errorf("统筹确认失败，放弃发布未经确认的问题: %s", summary.ConfirmationError)
+	}
+	if err := llm.BudgetError(ctx); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return &summary, nil
+}
+
+func analysisDiff(files []*diff.FileDiff, maxChars int) string {
+	var sb strings.Builder
+	for _, file := range files {
+		sb.WriteString(file.Patch)
+		if !strings.HasSuffix(file.Patch, "\n") {
+			sb.WriteByte('\n')
+		}
+	}
+	value := sb.String()
+	if maxChars > 0 && len(value) > maxChars {
+		return textbudget.Limit(value, maxChars) + "\n...[全局理解 diff 达到预算，已截断]"
+	}
+	return value
+}
+
+// ReviewLocalDiff 本地 diff 审查（demo 调试入口，不依赖 GitHub）。
+func (s *Service) ReviewLocalDiff(ctx context.Context, rawDiff, title string) (string, error) {
+	ctx, cancel := s.roundContext(ctx)
+	defer cancel()
+	summary, err := s.reviewDiff(ctx, rawDiff, "local/diff", title, "", s.logger)
+	if err != nil {
+		return "", err
+	}
+	if summary == nil {
+		return "", fmt.Errorf("筛选后无待审查文件")
+	}
+	return notifier.BuildComment(*summary, notifier.Options{
+		MaxIssuesDisplay: s.cfg.Notification.MaxIssuesDisplay,
+		CommitSHA:        "local",
+		Timezone:         s.tz,
+	}), nil
+}
+
+// reviewCodeupRepo 审查单个 Codeup 仓库的分支推送：
+// 拉取分支列表 -> 分支名过滤 -> 对比本地基线发现新提交 -> 增量审查。
+func (s *Service) reviewCodeupRepo(ctx context.Context, repo config.CodeupRepoConfig) error {
+	name := repo.DisplayName()
+	branches, err := s.cu.ListBranches(ctx, repo.RepositoryID)
+	if err != nil {
+		return err
+	}
+	s.logger.Info("获取分支列表", "repo", name, "count", len(branches))
+
+	baseBranch := repo.BaseBranch
+	if baseBranch == "" {
+		baseBranch = "master"
+	}
+
+	for _, br := range branches {
+		// 基准分支自身不做推送审查（其变更由 MR/PR 审查覆盖）
+		if br.Name == baseBranch || br.DefaultBranch {
+			continue
+		}
+		// 源分支名过滤
+		if !filter.MatchBranch(br.Name, repo.BranchFilter.Include, repo.BranchFilter.Exclude) {
+			s.logger.Debug("跳过分支：分支名不匹配", "repo", name, "branch", br.Name)
+			continue
+		}
+		if err := s.reviewBranchPush(ctx, repo, br, baseBranch); err != nil {
+			s.logger.Error("分支审查失败", "repo", name, "branch", br.Name, "error", err.Error())
+		}
+	}
+	return nil
+}
+
+// reviewBranchPush 审查单个分支的新提交（提交分支即审查）：
+// 基线与 HEAD 一致时跳过；首次发现默认仅记录基线（review_first_push 开启时
+// 对比基准分支全量审查）；其余情况对 基线..HEAD 做增量审查。
+// 审查成功后才推进基线，失败时下轮重试。
+func (s *Service) reviewBranchPush(ctx context.Context, repo config.CodeupRepoConfig,
+	br *codeup.Branch, baseBranch string) error {
+
+	name := repo.DisplayName()
+	head := br.Commit.ID
+	key := repo.RepositoryID + ":" + br.Name
+	log := s.logger.With("repo", name, "branch", br.Name, "sha", short(head))
+
+	// 【去重】基线已是当前 HEAD：无新提交
+	last := s.branchSt.Get(key)
+	if last == head {
+		return nil
+	}
+
+	from := last
+	if last == "" {
+		if !s.cfg.Codeup.ReviewFirstPush {
+			// 首次发现：仅记录基线，避免首轮全量审查存量分支
+			log.Info("首次发现分支，记录审查基线")
+			return s.branchSt.Set(key, head)
+		}
+		from = baseBranch // 首次全量：对比基准分支（Merge-Base）
+	}
+
+	rawDiff, commits, err := s.cu.GetCompareDiff(ctx, repo.RepositoryID, from, head)
+	if err != nil {
+		return err
+	}
+
+	title := fmt.Sprintf("分支 %s 新推送（%d 个提交）: %s", br.Name, len(commits), br.Commit.Title)
+	summary, err := s.reviewDiff(ctx, rawDiff, name, title, "", log)
+	if err != nil {
+		return err
+	}
+	if summary == nil {
+		// 筛选后无待审查文件：直接推进基线，避免下轮重复扫描
+		return s.branchSt.Set(key, head)
+	}
+
+	// 生成统一评论（提交人取分支最新 commit 作者）
+	body := notifier.BuildComment(*summary, notifier.Options{
+		MentionAuthor:    s.cfg.Notification.MentionAuthor,
+		MaxIssuesDisplay: s.cfg.Notification.MaxIssuesDisplay,
+		Author:           br.Commit.AuthorName,
+		CommitSHA:        head,
+		Timezone:         s.tz,
+	})
+
+	// 【评论发布开关】dry_run 或关闭 commit_comment 时只输出日志
+	if !s.cfg.Codeup.CommitComment || s.cfg.Review.DryRun {
+		log.Info("commit 评论发布已禁用（模拟审查），审查报告如下",
+			"issues", len(summary.Issues), "report", body)
+		return s.branchSt.Set(key, head)
+	}
+	if err := s.cu.CreateCommitComment(ctx, repo.RepositoryID, head, body); err != nil {
+		return err
+	}
+	log.Info("commit 评论已发布", "issues", len(summary.Issues))
+	return s.branchSt.Set(key, head)
+}
+
+// reviewCodeupMRs 审查单个 Codeup 仓库的开启状态合并请求：
+// MR 列表 -> 源分支过滤 -> 合并冲突检测 -> 合并源版本去重 -> diff 审查 -> MR 全局评论。
+func (s *Service) reviewCodeupMRs(ctx context.Context, repo config.CodeupRepoConfig) error {
+	name := repo.DisplayName()
+	mrs, err := s.cu.ListOpenChangeRequests(ctx, repo.RepositoryID)
+	if err != nil {
+		return err
+	}
+	s.logger.Info("获取开启 MR 列表", "repo", name, "count", len(mrs))
+
+	for _, mr := range mrs {
+		key := fmt.Sprintf("codeup:%s:%d", repo.RepositoryID, mr.LocalID)
+		// 源分支过滤（与分支推送审查共用 branch_filter，避免波及其他 MR）
+		if !filter.MatchBranch(mr.SourceBranch, repo.BranchFilter.Include, repo.BranchFilter.Exclude) {
+			s.logger.Debug("跳过 MR：源分支不匹配", "repo", name, "mr", mr.LocalID, "source", mr.SourceBranch)
+			continue
+		}
+		// 【WIP 检测】开发中的 MR 暂不审查，移除 WIP 前缀后自动进入审查
+		if mr.IsWIP() {
+			s.logger.Debug("跳过 MR：开发中（WIP）", "repo", name, "mr", mr.LocalID, "title", mr.Title)
+			continue
+		}
+		// 【合并冲突检测】存在冲突的 MR 无法生成 diff，跳过以节省 API 与 LLM 配额
+		if mr.HasConflict() {
+			if s.conflictTr.mark(key) {
+				s.logger.Info("跳过 MR：存在合并冲突，等待开发者解决后自动重审",
+					"repo", name, "mr", mr.LocalID, "merge_status", mr.MergeStatus)
+			}
+			continue
+		}
+		// MR 无冲突时，清除冲突跟踪记录
+		s.conflictTr.clear(key)
+		if err := s.reviewChangeRequest(ctx, repo, mr); err != nil {
+			s.logger.Error("MR 审查失败", "repo", name, "mr", mr.LocalID, "error", err.Error())
+		}
+	}
+	return nil
+}
+
+// reviewChangeRequest 审查单个合并请求：以合并源最新版本的 CommitID 作去重基线，
+// diff 取 目标分支..源分支（Merge-Base），结果发布为 MR 全局评论。
+func (s *Service) reviewChangeRequest(ctx context.Context, repo config.CodeupRepoConfig,
+	mr *codeup.ChangeRequest) error {
+
+	name := repo.DisplayName()
+	log := s.logger.With("repo", name, "mr", mr.LocalID, "source", mr.SourceBranch)
+
+	// 当前待审查的合并源版本（评论关联 + 去重基线）
+	ps, err := s.cu.ListPatchSets(ctx, repo.RepositoryID, mr.LocalID)
+	if err != nil {
+		return err
+	}
+	src := codeup.SourcePatchSet(ps)
+	if src == nil {
+		log.Warn("跳过 MR：未找到合并源版本")
+		return nil
+	}
+
+	// 【去重】该合并源版本已审查过（新推送会产生新版本/新 CommitID）
+	key := "mr:" + repo.RepositoryID + ":" + fmt.Sprint(mr.LocalID)
+	if s.branchSt.Get(key) == src.CommitID {
+		return nil
+	}
+	log = log.With("sha", short(src.CommitID))
+
+	targetSHA, err := s.mrTargetSHA(ctx, repo.RepositoryID, mr.TargetBranch, ps)
+	if err != nil {
+		return err
+	}
+	if src.CommitID == "" || src.PatchSetBizID == "" {
+		return fmt.Errorf("MR 源版本缺少提交 SHA 或版本 ID")
+	}
+	rawDiff, _, err := s.cu.GetCompareDiff(ctx, repo.RepositoryID, targetSHA, src.CommitID)
+	if err != nil {
+		return err
+	}
+
+	title := fmt.Sprintf("MR !%d %s（%s -> %s）", mr.LocalID, mr.Title, mr.SourceBranch, mr.TargetBranch)
+	summary, err := s.reviewDiff(ctx, rawDiff, name, title, mr.Description, log)
+	if err != nil {
+		return err
+	}
+	// The diff and comment version must remain the captured immutable snapshot.
+	fresh, err := s.cu.ListPatchSets(ctx, repo.RepositoryID, mr.LocalID)
+	if err != nil {
+		return err
+	}
+	current := codeup.SourcePatchSet(fresh)
+	freshTarget, err := s.mrTargetSHA(ctx, repo.RepositoryID, mr.TargetBranch, fresh)
+	if err != nil {
+		return err
+	}
+	if current == nil || current.CommitID != src.CommitID || current.PatchSetBizID != src.PatchSetBizID || freshTarget != targetSHA {
+		return fmt.Errorf("MR 版本在审查期间发生变化，放弃发布及基线推进")
+	}
+	if summary == nil {
+		return s.branchSt.Set(key, src.CommitID)
+	}
+
+	body := notifier.BuildComment(*summary, notifier.Options{
+		MentionAuthor:    s.cfg.Notification.MentionAuthor,
+		MaxIssuesDisplay: s.cfg.Notification.MaxIssuesDisplay,
+		Author:           mr.Author.Name,
+		CommitSHA:        src.CommitID,
+		Timezone:         s.tz,
+	})
+
+	// 【评论发布开关】dry_run 或关闭 mr_comment 时只输出日志
+	if !s.cfg.Codeup.MRComment || s.cfg.Review.DryRun {
+		log.Info("MR 评论发布已禁用（模拟审查），审查报告如下",
+			"issues", len(summary.Issues), "report", body)
+		return s.branchSt.Set(key, src.CommitID)
+	}
+	if err := s.cu.CreateChangeRequestComment(ctx, repo.RepositoryID, mr.LocalID,
+		src.PatchSetBizID, body); err != nil {
+		return err
+	}
+	log.Info("MR 评论已发布", "issues", len(summary.Issues))
+	return s.branchSt.Set(key, src.CommitID)
+}
+
+func (s *Service) mrTargetSHA(ctx context.Context, repository, targetBranch string, versions []*codeup.PatchSet) (string, error) {
+	var target *codeup.PatchSet
+	for _, p := range versions {
+		if p.RelatedMergeItemType == "MERGE_TARGET" && (target == nil || p.VersionNo > target.VersionNo) {
+			target = p
+		}
+	}
+	if target != nil && target.CommitID != "" {
+		return target.CommitID, nil
+	}
+	branches, err := s.cu.ListBranches(ctx, repository)
+	if err != nil {
+		return "", err
+	}
+	for _, b := range branches {
+		if b.Name == targetBranch && b.Commit.ID != "" {
+			return b.Commit.ID, nil
+		}
+	}
+	return "", fmt.Errorf("MR 目标分支 %s 没有可固定的提交 SHA", targetBranch)
+}
+
+func roleNames(agents []agent.Agent) string {
+	var names []string
+	for _, a := range agents {
+		names = append(names, a.Role())
+	}
+	return strings.Join(names, ",")
+}
+
+func short(sha string) string {
+	if len(sha) > 8 {
+		return sha[:8]
+	}
+	return sha
+}

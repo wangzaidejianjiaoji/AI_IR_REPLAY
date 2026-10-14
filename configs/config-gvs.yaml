@@ -1,0 +1,141 @@
+# config-gvs.yaml — gvs 仓库独立运行配置（Go 实时目标跟踪视频服务）
+# 绑定：规则文档 configs/review-rules-gvs.yaml + 理解文档 docs/gvs-code-understanding.md
+# 审查对象：Codeup lzvsg/gvs 的分支推送与开启状态合并请求
+# 运行前注入环境变量：CODEUP_ORG_ID / CODEUP_TOKEN / KIMI_API_KEY
+# 用法：gvs-pr-agent -config configs/config-gvs.yaml -once
+
+scheduler:
+  interval: "30m"
+  jitter: "30s"
+
+# GitHub 通道不使用（repos 留空）
+github:
+  repos: []
+
+# ============================================================
+# Codeup 配置（gvs 仓库）
+# ============================================================
+codeup:
+  enabled: true
+  domain: "openapi-rdc.aliyuncs.com"
+  organization_id: "${CODEUP_ORG_ID}"
+  token: "${CODEUP_TOKEN}"
+
+  repos:
+    - repository_id: "lizheng/lzvsg/gvs"   # 仓库全路径（自动 URL 编码）
+      name: "lzvsg/gvs"
+      base_branch: "main"                  # 基准分支（MR diff 目标分支）
+      branch_filter:
+        include: []                        # 为空表示不限制源分支
+        exclude:
+          - "release/*"
+
+  per_page: 100
+  state_path: "./data/gvs-branch-state.json"  # gvs 独立基线存储（与 gvs_infer 互不干扰）
+  review_first_push: false
+  commit_comment: false                     # 只回写 MR 评论，不发 commit 评论
+  mr_review: true
+  mr_comment: true
+
+llm:
+  provider: "kimi"
+  api_key: "${KIMI_API_KEY}"
+  base_url: "https://api.kimi.com/coding/v1"
+  models:
+    small: "kimi-for-coding"
+    medium: "kimi-for-coding"
+    large: "kimi-for-coding"
+  model_thresholds:
+    small: 500
+    medium: 3000
+  timeout: "600s"
+  max_tokens: 8000
+  temperature: 1
+  retry:
+    max_attempts: 3
+    base_delay: "2s"
+    max_delay: "30s"
+
+agents:
+  architect:   { enabled: true, priority: 1 }
+  security:    { enabled: true, priority: 1 }
+  performance: { enabled: true, priority: 1 }
+  standard:    { enabled: true, priority: 2 }
+  test:        { enabled: true, priority: 2 }
+  ai:          { enabled: true, priority: 2 }
+  ui:          { enabled: true, priority: 2 }
+  ai_tool:     { enabled: true, priority: 2 }
+  concurrency: { enabled: true, priority: 1 }
+  resource:    { enabled: true, priority: 1 }
+  dataflow:    { enabled: true, priority: 1 }
+
+review:
+  max_llm_calls: 100
+  max_round_tokens: 1000000
+  round_timeout: "20m"
+  max_round_cost: 0 # Set only with verified llm.prices in a single currency
+  dry_run: true                            # 默认只审查不发布；-dry-run 可再次强制
+  max_diff_chars: 60000
+  max_agent_concurrency: 4
+  max_files_per_review: 20                 # 超出即判定覆盖不完整并失败，禁止抽样通过
+  file_packaging:
+    enabled: true
+    max_package_size: 5
+  comment_location:
+    enabled: true
+    verify_line_number: true
+  comment_reflection:
+    enabled: true
+    check_hallucination: true
+  active_hours:
+    start: ""
+    end: ""
+    timezone: "Asia/Shanghai"
+  include_paths: []
+  exclude_paths:
+    - "**/vendor/**"
+    - "**/*_test.go"
+    - "**/ffmpeg_exe/**"
+    - "**/weights/**"
+    - "**/testvideo/**"
+    - "**/*.md"
+    - "**/*.yml"
+    - "**/*.yaml"
+    - "**/*.json"
+    - "**/*.sum"
+    - "**/*.mod"
+
+# ============================================================
+# 规则文档绑定：gvs 专用规则（四层链第 2 层；CLI -rule 仍可覆盖）
+# ============================================================
+rules:
+  project_path: "./configs/review-rules-gvs.yaml"
+  global_path: "~/.ai-review/review-rules.yaml"
+  hot_reload: true
+  reload_interval: "30s"
+
+# ============================================================
+# 全局代码理解绑定：gvs 专用理解文档
+# ============================================================
+understanding:
+  enabled: true
+  source_repository: "lizheng/lzvsg/gvs"
+  source_branch: "main"
+  document_path: "./docs/gvs-code-understanding.md"
+  seed_path: "./GO_AI_PR_Review.md"
+  strict: false
+
+notification:
+  pr_comment: false
+  mention_author: true
+  mention_reviewers: true
+  max_issues_display: 10
+
+logging:
+  level: "info"
+  format: "gvs"
+  output: "stdout"
+
+server:
+  admin_token: "${AGENT_ADMIN_TOKEN}"
+  addr: "127.0.0.1:8081"

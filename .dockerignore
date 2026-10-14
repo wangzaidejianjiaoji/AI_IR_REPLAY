@@ -1,0 +1,9 @@
+.git
+.gotmp
+gotmp
+data
+outputs
+bin
+env*
+*.exe
+.pytest_cache

@@ -1,0 +1,144 @@
+2026/10/13 14:08:37 [I] gvs-pr-agent 启动 config=configs/config.mock.yaml dry_run=true pr_comment=false
+2026/10/13 14:08:37 [I] 规则文档已加载 source=项目配置 version=4.2
+2026/10/13 14:08:37 [I] 已启用 Agent count=8 roles=security,performance,architect,ui,ai_tool,standard,test,ai
+2026/10/13 14:08:37 [I] 规则热更新已启用 interval=5s source=项目配置
+2026/10/13 14:08:37 [I] 开始审查 title=本地 diff 审查: testdata/sample.patch files=2 packages=HTTP API 模块(1文件)、AI 推理模块(1文件) changed_lines=24 model=mock-8k
+2026/10/13 14:08:37 [I] agent 开始审查 agent=security package=HTTP API 模块 model=mock-8k
+2026/10/13 14:08:37 [I] agent 开始审查 agent=architect package=HTTP API 模块 model=mock-8k
+2026/10/13 14:08:37 [I] agent 开始审查 agent=security package=AI 推理模块 model=mock-8k
+2026/10/13 14:08:37 [I] agent 开始审查 agent=architect package=AI 推理模块 model=mock-8k
+2026/10/13 14:08:37 [I] agent 审查完成 agent=architect package=AI 推理模块 issues=0 tokens=1380 error=
+2026/10/13 14:08:37 [I] agent 审查完成 agent=security package=AI 推理模块 issues=2 tokens=1380 error=
+2026/10/13 14:08:37 [I] agent 开始审查 agent=performance package=AI 推理模块 model=mock-8k
+2026/10/13 14:08:37 [I] agent 审查完成 agent=security package=HTTP API 模块 issues=2 tokens=1380 error=
+2026/10/13 14:08:37 [I] agent 审查完成 agent=architect package=HTTP API 模块 issues=0 tokens=1380 error=
+2026/10/13 14:08:37 [I] agent 审查完成 agent=performance package=AI 推理模块 issues=2 tokens=1380 error=
+2026/10/13 14:08:37 [I] agent 开始审查 agent=ai package=AI 推理模块 model=mock-8k
+2026/10/13 14:08:37 [I] agent 开始审查 agent=ui package=HTTP API 模块 model=mock-8k
+2026/10/13 14:08:37 [I] agent 开始审查 agent=ai_tool package=AI 推理模块 model=mock-8k
+2026/10/13 14:08:37 [I] agent 开始审查 agent=standard package=HTTP API 模块 model=mock-8k
+2026/10/13 14:08:37 [I] agent 审查完成 agent=ai package=AI 推理模块 issues=2 tokens=1380 error=
+2026/10/13 14:08:37 [I] agent 审查完成 agent=standard package=HTTP API 模块 issues=1 tokens=1380 error=
+2026/10/13 14:08:37 [I] agent 开始审查 agent=standard package=AI 推理模块 model=mock-8k
+2026/10/13 14:08:37 [I] agent 审查完成 agent=ai_tool package=AI 推理模块 issues=1 tokens=1380 error=
+2026/10/13 14:08:37 [I] agent 审查完成 agent=ui package=HTTP API 模块 issues=1 tokens=1380 error=
+2026/10/13 14:08:37 [I] agent 审查完成 agent=standard package=AI 推理模块 issues=1 tokens=1380 error=
+2026/10/13 14:08:37 [I] 审查完成 issues=7 dropped=5 failed_agents=[] total_tokens=13800
+## AI 代码审查报告（多 Agent 协作）
+
+### 本次代码变更总结
+
+全局理解阶段未返回变更总结。
+
+### 验证总览
+
+全局理解文档：未启用；审查覆盖 2/2 个文件；专业 Agent 成功参与 7 个，失败 0 个；定位/反思过滤 5 个候选。
+
+### 统筹确认总览
+
+统筹确认阶段未返回额外说明；以下为经定位和反思过滤后的问题。
+
+### 确认的问题
+
+**审查结果：发现问题**（共 7 个，由 5 个 Agent 发现，2 个审查包）
+
+### 安全专家（发现 2 个问题）
+
+| 严重度 | 文件 | 行号 | 问题 | 建议 |
+|--------|------|------|------|------|
+| critical | gvhttp/handler.go | 16 | ffprobe 命令注入 | 使用 exec.Command 传参数列表，禁止 sh -c 字符串拼接 |
+| high | gvhttp/handler.go | 16 | 硬编码摄像头凭据 | 凭据从配置或环境变量读取，避免入库泄露 |
+
+**[critical] gvhttp/handler.go:16 ffprobe 命令注入**
+- **问题**：cameraID 直接拼接进 sh -c 命令，攻击者可通过 camera_id 参数注入任意命令
+- **建议**：使用 exec.Command 传参数列表，禁止 sh -c 字符串拼接
+- **参考代码**：
+```go
+cmd := exec.Command("ffprobe", rtspURL)
+```
+
+**[high] gvhttp/handler.go:16 硬编码摄像头凭据**
+- **问题**：RTSP URL 中硬编码了 admin:admin123 凭据
+- **建议**：凭据从配置或环境变量读取，避免入库泄露
+
+---
+
+### AI 专家、AI 工具使用专家（发现 1 个问题）
+
+| 严重度 | 文件 | 行号 | 问题 | 建议 |
+|--------|------|------|------|------|
+| high | dnn/yolov5/detector.go | 24 | 预处理缺少归一化步骤 | BlobFromImage 第二个参数使用 1.0/255.0 完成归一化 |
+
+**[high] dnn/yolov5/detector.go:24 预处理缺少归一化步骤**
+- **问题**：输入未归一化到 [0,1] 区间就送入模型推理，与 AI 专家发现的问题相同（用于验证跨 Agent 去重）
+- **建议**：BlobFromImage 第二个参数使用 1.0/255.0 完成归一化
+
+---
+
+### 性能专家（发现 2 个问题）
+
+| 严重度 | 文件 | 行号 | 问题 | 建议 |
+|--------|------|------|------|------|
+| high | gvhttp/handler.go | 22 | goroutine 泄漏 | 监听 ctx.Done() 并增加轮询间隔 |
+| medium | dnn/yolov5/detector.go | 25 | gocv Mat 未释放 | 添加 defer blob.Close() 和 defer prob.Close() |
+
+**[high] gvhttp/handler.go:22 goroutine 泄漏**
+- **问题**：go func 内 for 死循环无退出条件，每次请求都会泄漏一个 goroutine
+- **建议**：监听 ctx.Done() 并增加轮询间隔
+- **参考代码**：
+```go
+for {
+  select {
+  case <-ctx.Done():
+    return
+  case <-ticker.C:
+    checkCamera(cameraID)
+  }
+}
+```
+
+**[medium] dnn/yolov5/detector.go:25 gocv Mat 未释放**
+- **问题**：BlobFromImage 返回的 blob 和 Forward 返回的 prob 未 Close，cgo 内存泄漏
+- **建议**：添加 defer blob.Close() 和 defer prob.Close()
+- **参考代码**：
+```go
+defer blob.Close()
+```
+
+---
+
+### UI 设计专家（发现 1 个问题）
+
+| 严重度 | 文件 | 行号 | 问题 | 建议 |
+|--------|------|------|------|------|
+| medium | gvhttp/handler.go | 18 | 错误响应格式不统一 | 统一使用 {code, message, data} JSON 结构返回 |
+
+**[medium] gvhttp/handler.go:18 错误响应格式不统一**
+- **问题**：c.String(500, err.Error()) 直接返回裸错误字符串，未使用统一 Response 包装
+- **建议**：统一使用 {code, message, data} JSON 结构返回
+- **参考代码**：
+```go
+c.JSON(500, Response{Code:500, Message:err.Error()})
+```
+
+---
+
+### 代码规范专家（发现 1 个问题）
+
+| 严重度 | 文件 | 行号 | 问题 | 建议 |
+|--------|------|------|------|------|
+| low | gvhttp/handler.go | 18 | 错误处理返回裸字符串 | 记录日志后返回通用错误信息 |
+
+**[low] gvhttp/handler.go:18 错误处理返回裸字符串**
+- **问题**：err.Error() 直接透传给客户端，泄漏内部实现细节
+- **建议**：记录日志后返回通用错误信息
+
+---
+
+---
+*审查时间：2026-10-13 14:08:37 | Commit：`local` | Token 消耗：13800*
+*参与 Agent：架构师、安全专家、性能专家、AI 专家、代码规范专家、AI 工具使用专家、UI 设计专家（7/8，按变更文件路径智能分配）*
+*审查包：HTTP API 模块、AI 推理模块*
+
+<!-- AI-REVIEW: local -->
+
