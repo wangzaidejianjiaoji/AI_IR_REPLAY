@@ -3,7 +3,6 @@
 后台启动 AI_IR_REPLAY 的 GVS / infer 常驻审核实例。
 
 .DESCRIPTION
-本文件用于 Windows PowerShell；Linux 请运行 bash ./start-persistent.sh。
 在 PowerShell 中运行，默认同时启动两个实例；也可通过 -Instance 单独选择。
 守护进程自动加载本机凭据，审核进程退出后等待 15 秒重启。
 重复启动同一实例会被文件锁拦截，不会再创建一套审核服务。

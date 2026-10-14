@@ -4,7 +4,6 @@ bin/
 env
 out*.md
 out*.txt
-env.md
 data/mvp-*-state.json
 
 # Local credentials, runtime state, and generated scratch files
