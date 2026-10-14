@@ -79,7 +79,7 @@ func (a *Analyzer) Analyze(ctx context.Context, in Input) (ChangeContext, llm.Us
 	}
 	var out ChangeContext
 	if err := json.Unmarshal([]byte(text), &out); err != nil {
-		return ChangeContext{}, usage, fmt.Errorf("解析全局理解模型输出: %w (raw 头 200 字=%s)", err, truncateForLog(content, 200))
+		return ChangeContext{}, usage, fmt.Errorf("解析全局理解模型输出: %w (raw 头 500 字=%s)", err, truncateForLog(content, 500))
 	}
 	return out, usage, nil
 }
