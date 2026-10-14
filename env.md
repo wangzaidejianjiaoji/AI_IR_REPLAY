@@ -12,6 +12,13 @@
 | base_url | `https://api.kimi.com/coding/v1` |
 | 模型 | `kimi-for-coding` |
 
+### Codeup 本地凭据登记（2026-10-14 用户临时登记，本文件已在 Git 跟踪，禁止 `git commit` 推送本版到远程）
+
+| 项 | 值 |
+|---|---|
+| CODEUP_TOKEN | `pt-HE9urvi1slnXHz5jeshN8M4a_83b99f21-5ad6-4cb7-998d-1c18c123a8b4` |
+| CODEUP_ORG_ID | `6515185d921086200571953d` |
+
 密钥取自本项目的 runtime-env.ps1，于 2026-10-14 重新登记；本次未调用线上 API 验证有效性。
 
 运行时使用的 KIMI_API_KEY、CODEUP_TOKEN 和 CODEUP_ORG_ID 保存在本机用户目录下的运行脚本：

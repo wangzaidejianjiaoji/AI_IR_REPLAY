@@ -138,4 +138,4 @@ logging:
 
 server:
   admin_token: "${AGENT_ADMIN_TOKEN}"
-  addr: "127.0.0.1:8081"
+  addr: "127.0.0.1:8083"

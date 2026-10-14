@@ -9,7 +9,7 @@ set -euo pipefail
 if [[ $# -ne 1 ]]; then echo 'Usage: bash run-persistent.sh [gvs|gvs-infer]' >&2; exit 2; fi
 instance=$1
 case "$instance" in
-    gvs) port=8081 ;;
+    gvs) port=8083 ;;
     gvs-infer) port=8082 ;;
     *) echo 'Usage: bash run-persistent.sh [gvs|gvs-infer]' >&2; exit 2 ;;
 esac
