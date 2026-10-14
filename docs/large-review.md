@@ -23,3 +23,15 @@
 本地模拟测试覆盖 75 文件 MR 完整评论与基线推进、后部 diff 分析、45 个候选全部确认、按 JSON 编码后证据大小分批、遗漏决定拒绝发布、超大文件不调用模型、专业作业部分失败不发布及长源代码行不吞掉后续文件。
 
 真实模型配额及真实 Codeup 评论成功需要实际运行日志确认，模拟测试不证明业务缺陷检出率。已知知识来源隔离测试失败不属于本次变更的修复范围。
+
+## 跨平台常驻启动
+
+Windows 使用 `.\start-persistent.ps1`；Linux 使用 `bash ./start-persistent.sh`。Linux 入口接受 `all`（默认）、`gvs`、`gvs-infer`，完整使用说明及停止命令在脚本头部注释，也可运行 `bash ./start-persistent.sh --help`。
+
+Linux 需 Bash、nohup 和 util-linux 的 flock。若 `bin/gvs-pr-agent` 不存在或不可执行，脚本通过 Go 1.23+ 在本机构建 Linux 二进制，并嵌入时区数据；已有二进制不会自动重编译。代码更新后需停止实例、重新构建并再启动。Linux 不使用 Windows `.exe`。
+
+凭据使用已导出的环境变量，或 `${XDG_CONFIG_HOME:-$HOME/.config}/AI_IR_REPLAY/runtime-env.sh`；`AI_IR_RUNTIME_ENV` 可指定其他凭据文件。Linux 不能 source Windows 的 PowerShell 凭据脚本。
+
+Linux 使用 nohup 后台运行，进程退出后 15 秒重启，flock 防止同一项目同一实例重复运行。向 `data/runtime/<实例>.supervisor.pid` 中的 PID 发送 SIGTERM 会同时停止守护进程及当前审核子进程。日志为 UTF-8。当前没有安装 systemd 服务，Linux 重启后需重新启动；Windows 原有登录启动项不受影响。
+
+隔离的 Linux 守护冒烟测试：`bash tools/test-persistent-linux.sh`。使用临时目录中的假审核程序，不调用真实平台或模型；覆盖重复启动、重启及停止子进程。没有 flock 时退出码 77 表示生命周期测试被跳过，不代表通过。
