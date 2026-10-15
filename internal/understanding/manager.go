@@ -18,6 +18,7 @@ import (
 )
 
 var sourceSHARe = regexp.MustCompile(`<!--\s*(?:GVS-)?SOURCE-SHA:\s*([0-9A-Za-z._-]+)\s*-->`)
+var sourceRepositoryRe = regexp.MustCompile(`<!--\s*SOURCE-REPOSITORY:\s*(.*?)\s*-->`)
 
 // Repository is the Codeup surface used by Manager.
 type Repository interface {
@@ -62,6 +63,11 @@ func (m *Manager) Prepare(ctx context.Context, modelName string) (Snapshot, llm.
 	doc, exists, err := loadDocument(m.cfg.DocumentPath)
 	if err != nil {
 		return Snapshot{}, llm.Usage{}, fmt.Errorf("读取本地全局代码理解文档: %w", err)
+	}
+	for _, marker := range sourceRepositoryRe.FindAllStringSubmatch(doc, -1) {
+		if strings.TrimSpace(marker[1]) != m.cfg.SourceRepository {
+			return Snapshot{}, llm.Usage{}, fmt.Errorf("理解文档来源仓库不匹配：配置 %s，文档 %s", m.cfg.SourceRepository, strings.TrimSpace(marker[1]))
+		}
 	}
 	previous := sourceSHA(doc)
 	fallback := Snapshot{Document: doc, SourceSHA: previous}
@@ -171,7 +177,8 @@ func (m *Manager) updateDocument(ctx context.Context, modelName, current, delta 
 	} else {
 		user += "\n\n这是首次建立理解文档；基于初始化材料形成可持续增量维护的全局理解。"
 	}
-	content, usage, err := m.model.Chat(ctx, modelName, []llm.Message{{Role: "system", Content: system}, {Role: "user", Content: user}})
+	messages := []llm.Message{{Role: "system", Content: system}, {Role: "user", Content: user}}
+	content, usage, err := m.model.Chat(ctx, modelName, messages)
 	if err != nil {
 		return "", usage, fmt.Errorf("更新全局代码理解文档: %w", err)
 	}
@@ -180,6 +187,7 @@ func (m *Manager) updateDocument(ctx context.Context, modelName, current, delta 
 	content = strings.TrimPrefix(content, "```md")
 	content = strings.TrimSuffix(content, "```")
 	if strings.TrimSpace(content) == "" {
+		llm.InvalidateCheckpoint(ctx, m.model, modelName, messages)
 		return "", usage, fmt.Errorf("更新全局代码理解文档: 模型返回空内容")
 	}
 	return strings.TrimSpace(content), usage, nil

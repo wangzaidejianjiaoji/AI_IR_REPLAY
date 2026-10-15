@@ -179,6 +179,7 @@ type Agent struct {
 
 // ReviewConfig 审查行为配置。
 type ReviewConfig struct {
+	CheckpointDir       string   `yaml:"checkpoint_dir"`
 	DryRun              bool     `yaml:"dry_run"`
 	MaxDiffChars        int      `yaml:"max_diff_chars"`
 	MaxAgentConcurrency int      `yaml:"max_agent_concurrency"`

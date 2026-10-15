@@ -1,55 +1,84 @@
 <#
 .SYNOPSIS
-后台启动 AI_IR_REPLAY 的 GVS / infer 常驻审核实例。
-
-.DESCRIPTION
-在 PowerShell 中运行，默认同时启动两个实例；也可通过 -Instance 单独选择。
-守护进程自动加载本机凭据，审核进程退出后等待 15 秒重启。
-重复启动同一实例会被文件锁拦截，不会再创建一套审核服务。
-关闭启动终端不影响后台运行；注销或关机期间不运行。
-脚本按现有配置发布 MR 评论，模型调用可能收费。
-
-运行前需已有 bin\gvs-pr-agent.exe，以及本机凭据脚本：
-%LOCALAPPDATA%\AI_IR_REPLAY\runtime-env.ps1（凭据不放入项目）。
-
-.PARAMETER Instance
-all：同时启动 GVS 和 infer（默认）；gvs：仅 GVS；gvs-infer：仅 infer。
-
+启动后台定时审核，或前台执行一次指定 MR 审核。
 .EXAMPLE
-Set-Location 'D:\DeepSeekHarness\AI_IR_REPLAY'
-.\start-persistent.ps1
-
-.EXAMPLE
-.\start-persistent.ps1 -Instance gvs
-
-.EXAMPLE
-.\start-persistent.ps1 -Instance gvs-infer
-
-.EXAMPLE
-# 若执行策略阻止脚本，仅为本次启动指定策略：
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\start-persistent.ps1
-
+.\start-persistent.ps1                                           # 定时：GVS + infer
+.\start-persistent.ps1 -Mode scheduled -Instance gvs              # 定时：仅 GVS
+.\start-persistent.ps1 -Instance gvs-infer                         # 定时：仅 infer
+.\start-persistent.ps1 -Mode manual -Instance gvs -MR 123 -DryRun   # 手动：替换编号；移除 -DryRun 发布评论
 .NOTES
-查看帮助：Get-Help .\start-persistent.ps1 -Full
-日志：项目 data\runtime\<实例>-<启动日期>.log；日志为 Unicode 格式。
-健康检查：http://127.0.0.1:8081/health（GVS）、:8082/health（infer）。
-健康接口只表示服务存活，审核及评论是否成功需查看日志。
-停止时先结束对应 run-persistent.ps1 守护进程，再结束其审核子进程。
-仅停止审核子进程会自动重启；下次用户登录仍会按已有登录启动项启动。
+在项目目录运行。手动模式必须选单个实例；先停止其守护进程和审核进程。
+可选 -Repo <配置内仓库全路径>、-CheckpointDir <目录>；默认检查点为 data/checkpoints/<实例>。
+定时模式后台运行，审核进程退出后 15 秒重启；日志在 data/runtime。
+依赖新版 bin/gvs-pr-agent.exe 和 %LOCALAPPDATA%\AI_IR_REPLAY\runtime-env.ps1。
+执行策略受限时：powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\start-persistent.ps1
 #>
+[CmdletBinding()]
 param(
     [ValidateSet('all', 'gvs', 'gvs-infer')]
-    [string]$Instance = 'all'
+    [string]$Instance = 'all',
+    [ValidateSet('scheduled', 'manual')]
+    [string]$Mode = 'scheduled',
+    [int]$MR,
+    [string]$Repo,
+    [switch]$DryRun,
+    [string]$CheckpointDir
 )
 
 $ErrorActionPreference = 'Stop'
+if ($Mode -eq 'manual') {
+    if ($Instance -eq 'all' -or $MR -le 0) {
+        throw 'Manual mode requires -Instance gvs|gvs-infer and -MR <positive integer>.'
+    }
+    if ($PSBoundParameters.ContainsKey('Repo') -and [string]::IsNullOrWhiteSpace($Repo)) {
+        throw '-Repo must not be empty.'
+    }
+    if ($PSBoundParameters.ContainsKey('CheckpointDir') -and [string]::IsNullOrWhiteSpace($CheckpointDir)) {
+        throw '-CheckpointDir must not be empty.'
+    }
+} else {
+    foreach ($manualOption in @('MR', 'Repo', 'DryRun', 'CheckpointDir')) {
+        if ($PSBoundParameters.ContainsKey($manualOption)) { throw "-$manualOption requires -Mode manual." }
+    }
+}
 $supervisor = Join-Path $PSScriptRoot 'run-persistent.ps1'
 $credentials = Join-Path $env:LOCALAPPDATA 'AI_IR_REPLAY\runtime-env.ps1'
 $binary = Join-Path $PSScriptRoot 'bin\gvs-pr-agent.exe'
-foreach ($required in @($supervisor, $credentials, $binary)) {
+$requiredFiles = @($credentials, $binary)
+if ($Mode -eq 'scheduled') { $requiredFiles += $supervisor }
+foreach ($required in $requiredFiles) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "Required file missing: $required"
     }
+}
+if ($Mode -eq 'manual') {
+    $config = "configs/config-$Instance.yaml"
+    if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot $config) -PathType Leaf)) { throw "Missing config: $config" }
+    if (-not $Repo) {
+        $Repo = if ($Instance -eq 'gvs') { 'lizheng/lzvsg/gvs' } else { 'lizheng/lzvsg/gvs_infer' }
+    }
+    if (-not $CheckpointDir) { $CheckpointDir = "data/checkpoints/$Instance" }
+    $runtimeDir = Split-Path $credentials -Parent
+    $manualLock = $null
+    try {
+        $manualLock = [IO.File]::Open((Join-Path $runtimeDir ($Instance + '.supervisor.lock')), 'OpenOrCreate', 'ReadWrite', 'None')
+    } catch { throw "Instance $Instance is busy. Stop its supervisor and agent before manual review; do not delete lock files." }
+    try {
+        . $credentials | Out-Null
+        foreach ($required in @('KIMI_API_KEY', 'CODEUP_TOKEN', 'CODEUP_ORG_ID')) {
+            if (-not [Environment]::GetEnvironmentVariable($required)) { throw "Missing environment variable: $required" }
+        }
+        Remove-Item Env:AGENT_REVIEW_DRY_RUN -ErrorAction SilentlyContinue
+        $env:ZONEINFO = Join-Path $PSScriptRoot '.gotmp\go1.23.12\go\lib\time\zoneinfo.zip'
+        $agentArguments = @('-config', $config, '-repo', $Repo, '-mr', "$MR", '-checkpoint-dir', $CheckpointDir)
+        if ($DryRun) { $agentArguments += '-dry-run' }
+        Push-Location -LiteralPath $PSScriptRoot
+        try {
+            & $binary @agentArguments
+            $reviewExitCode = $LASTEXITCODE
+        } finally { Pop-Location }
+    } finally { $manualLock.Dispose() }
+    exit $reviewExitCode
 }
 $instances = if ($Instance -eq 'all') { @('gvs', 'gvs-infer') } else { @($Instance) }
 foreach ($name in $instances) {

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Linux single-instance supervisor. Normally started by start-persistent.sh.
-# Foreground use: bash ./run-persistent.sh gvs  (or gvs-infer).
-# Credentials: ~/.config/AI_IR_REPLAY/runtime-env.sh, respecting XDG_CONFIG_HOME,
-# or AI_IR_RUNTIME_ENV; exported variables are also accepted.
-# SIGTERM/SIGINT stop the supervisor AND its current agent/restart-delay child.
-# Do not delete lock files to bypass an active instance.
+# 作用：单实例定时审核守护循环；通常由 start-persistent.sh 后台启动。
+#   bash ./run-persistent.sh gvs          # 前台守护 GVS
+#   bash ./run-persistent.sh gvs-infer    # 前台守护 infer
+# 加载 configs/config-<实例>.yaml；凭据来自环境变量或外部 runtime-env.sh。
+# 凭据默认 ~/.config/AI_IR_REPLAY/runtime-env.sh；支持 XDG_CONFIG_HOME、AI_IR_RUNTIME_ENV。
+# flock 防重复启动；审核进程退出后 15 秒重启，日志在 data/runtime。
+# 停止（同时停止审核子进程；infer 将 gvs 替换为 gvs-infer）：
+#   kill "$(cat data/runtime/gvs.supervisor.pid)"
+# 手动指定 MR 请用 start-persistent.sh；不要删除锁文件绕过运行中的实例。
 set -euo pipefail
 if [[ $# -ne 1 ]]; then echo 'Usage: bash run-persistent.sh [gvs|gvs-infer]' >&2; exit 2; fi
 instance=$1

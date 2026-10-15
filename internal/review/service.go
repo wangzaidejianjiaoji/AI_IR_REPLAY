@@ -616,6 +616,61 @@ func (s *Service) reviewBranchSnapshot(ctx context.Context, repo config.CodeupRe
 	return s.branchSt.Set(key, head)
 }
 
+type focusedMRKey struct{}
+
+// ReviewCodeupMR reviews one explicitly selected configured MR without scanning
+// branch pushes. An exact selection deliberately bypasses polling branch filters.
+func (s *Service) ReviewCodeupMR(ctx context.Context, repositoryID string, localID int) error {
+	if strings.TrimSpace(repositoryID) == "" || localID <= 0 {
+		return fmt.Errorf("Codeup 仓库与正整数 MR ID 必须指定")
+	}
+	if !s.cfg.Codeup.Enabled || !s.cfg.Codeup.MRReview || s.cu == nil {
+		return fmt.Errorf("Codeup MR 审查未启用")
+	}
+	var selected *config.CodeupRepoConfig
+	for i := range s.cfg.Codeup.Repos {
+		repo := &s.cfg.Codeup.Repos[i]
+		if repo.RepositoryID != repositoryID {
+			continue
+		}
+		if selected != nil {
+			return fmt.Errorf("Codeup 仓库重复配置: %s", repositoryID)
+		}
+		selected = repo
+	}
+	if selected == nil {
+		return fmt.Errorf("Codeup 仓库未配置: %s", repositoryID)
+	}
+	ctx, cancel := s.roundContext(ctx)
+	defer cancel()
+	if !s.cfg.Review.InActiveHours(time.Now()) {
+		return fmt.Errorf("当前不在审查时间窗口内")
+	}
+	mrs, err := s.cu.ListOpenChangeRequests(ctx, repositoryID)
+	if err != nil {
+		return err
+	}
+	for _, mr := range mrs {
+		if mr == nil || mr.LocalID != localID {
+			continue
+		}
+		if mr.State == "CLOSED" || mr.State == "MERGED" {
+			return fmt.Errorf("MR !%d 已关闭或合并", localID)
+		}
+		if mr.SourceBranch == "" || mr.TargetBranch == "" {
+			return fmt.Errorf("MR !%d 缺少源分支或目标分支", localID)
+		}
+		if mr.IsWIP() {
+			return fmt.Errorf("MR !%d 为 WIP", localID)
+		}
+		if mr.HasConflict() {
+			return fmt.Errorf("MR !%d 存在合并冲突", localID)
+		}
+		return s.reviewChangeRequest(context.WithValue(ctx, focusedMRKey{}, true), *selected, mr)
+	}
+	return fmt.Errorf("未找到开启的 MR %s!%d", repositoryID, localID)
+}
+
 // reviewCodeupMRs 审查单个 Codeup 仓库的开启状态合并请求：
 // MR 列表 -> 源分支过滤 -> 合并冲突检测 -> 合并源版本去重 -> diff 审查 -> MR 全局评论。
 func (s *Service) reviewCodeupMRs(ctx context.Context, repo config.CodeupRepoConfig) error {
@@ -680,11 +735,17 @@ func (s *Service) reviewChangeRequestSnapshot(ctx context.Context, repo config.C
 	}
 	src := codeup.SourcePatchSet(ps)
 	if src == nil {
+		if ctx.Value(focusedMRKey{}) == true {
+			return fmt.Errorf("MR 未找到合并源版本")
+		}
 		log.Warn("跳过 MR：未找到合并源版本")
 		return nil
 	}
 
 	// 【去重】该合并源版本已审查过（新推送会产生新版本/新 CommitID）
+	if ctx.Value(focusedMRKey{}) == true && (src.CommitID == "" || src.PatchSetBizID == "") {
+		return fmt.Errorf("MR 源版本缺少提交 SHA 或版本 ID")
+	}
 	key := "mr:" + repo.RepositoryID + ":" + fmt.Sprint(mr.LocalID)
 	if s.branchSt.Get(key) == src.CommitID {
 		return nil
@@ -704,9 +765,16 @@ func (s *Service) reviewChangeRequestSnapshot(ctx context.Context, repo config.C
 	}
 
 	title := fmt.Sprintf("MR !%d %s（%s -> %s）", mr.LocalID, mr.Title, mr.SourceBranch, mr.TargetBranch)
+	if s.cfg.Review.CheckpointDir != "" {
+		scope := fmt.Sprintf("%s!%d:%s:%s", repo.RepositoryID, mr.LocalID, src.CommitID, targetSHA)
+		ctx = llm.WithCheckpoint(ctx, s.cfg.Review.CheckpointDir, scope)
+	}
 	summary, err := s.reviewDiff(ctx, rawDiff, name, title, mr.Description, log)
 	if err != nil {
 		return err
+	}
+	if summary == nil && ctx.Value(focusedMRKey{}) == true {
+		return fmt.Errorf("MR 无有效的待审查文件（diff 为空或被路径规则筛除）")
 	}
 	// The diff and comment version must remain the captured immutable snapshot.
 	fresh, err := s.cu.ListPatchSets(ctx, repo.RepositoryID, mr.LocalID)

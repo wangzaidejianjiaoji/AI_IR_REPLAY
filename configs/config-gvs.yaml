@@ -2,7 +2,8 @@
 # 绑定：规则文档 configs/review-rules-gvs.yaml + 理解文档 docs/gvs-code-understanding.md
 # 审查对象：Codeup lzvsg/gvs 的分支推送与开启状态合并请求
 # 运行前注入环境变量：CODEUP_ORG_ID / CODEUP_TOKEN / KIMI_API_KEY
-# 用法：gvs-pr-agent -config configs/config-gvs.yaml -once
+# 定时审查：gvs-pr-agent -config configs/config-gvs.yaml
+# 手动指定 MR：gvs-pr-agent -config configs/config-gvs.yaml -repo lizheng/lzvsg/gvs -mr <正整数编号>
 
 scheduler:
   interval: "1m"
@@ -26,8 +27,7 @@ codeup:
       name: "lzvsg/gvs"
       base_branch: "main"                  # 基准分支（MR diff 目标分支）
       branch_filter:
-        include:
-          - "ws100-1012"                  # 【临时】仅允许 ws100-1012 通过过滤（分支 + MR 源共用）
+        include: []                        # 定时扫描不限定源分支；需要时配置通配模式
         exclude: []
 
   per_page: 100

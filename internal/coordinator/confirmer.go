@@ -154,10 +154,17 @@ func (c *Confirmer) confirmBatch(ctx context.Context, in ConfirmationInput, inpu
 		allowed[candidate.ID] = candidate.Issue
 	}
 	encoded, _ := json.Marshal(input)
-	content, usage, err := c.client.Chat(ctx, in.Model, []llm.Message{{Role: "system", Content: confirmationSystem}, {Role: "user", Content: confirmationUser(in.ChangeContext, encoded)}})
+	messages := []llm.Message{{Role: "system", Content: confirmationSystem}, {Role: "user", Content: confirmationUser(in.ChangeContext, encoded)}}
+	content, usage, err := c.client.Chat(ctx, in.Model, messages)
 	if err != nil {
 		return result, usage, fmt.Errorf("统筹确认 Agent: %w", err)
 	}
+	validated := false
+	defer func() {
+		if !validated {
+			llm.InvalidateCheckpoint(ctx, c.client, in.Model, messages)
+		}
+	}()
 	var raw struct {
 		Overview  string `json:"overview"`
 		Decisions *[]struct {
@@ -221,6 +228,7 @@ func (c *Confirmer) confirmBatch(ctx context.Context, in ConfirmationInput, inpu
 		}
 		return a.Line < b.Line
 	})
+	validated = true
 	return result, usage, nil
 }
 func limitConfirmation(value string, max int) string { return textbudget.Limit(value, max) }

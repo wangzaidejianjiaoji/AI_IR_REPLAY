@@ -77,13 +77,11 @@ func (a *baseAgent) Review(ctx context.Context, task Task) Result {
 
 	sys := prompt.System(a.name, a.focus, task.Rules)
 	usr := prompt.User(task.RepoFullName, task.PRTitle, task.PRBody, task.Package, task.Diff, task.ChangeContext)
+	messages := []llm.Message{{Role: "system", Content: sys}, {Role: "user", Content: usr}}
 
 	const maxParseAttempts = 2
 	for attempt := 1; attempt <= maxParseAttempts; attempt++ {
-		content, usage, err := a.client.Chat(ctx, task.Model, []llm.Message{
-			{Role: "system", Content: sys},
-			{Role: "user", Content: usr},
-		})
+		content, usage, err := a.client.Chat(ctx, task.Model, messages)
 		res.Usage.PromptTokens += usage.PromptTokens
 		res.Usage.CompletionTokens += usage.CompletionTokens
 		res.Usage.TotalTokens += usage.TotalTokens
@@ -94,6 +92,7 @@ func (a *baseAgent) Review(ctx context.Context, task Task) Result {
 
 		issues, perr := parseIssues(content)
 		if perr != nil {
+			llm.InvalidateCheckpoint(ctx, a.client, task.Model, messages)
 			a.logger.Warn("解析 agent 输出失败", "agent", a.role, "attempt", attempt,
 				"error", perr.Error(), "raw", truncate(content, 300))
 			res.Err = fmt.Errorf("agent %s parse: %w", a.role, perr)

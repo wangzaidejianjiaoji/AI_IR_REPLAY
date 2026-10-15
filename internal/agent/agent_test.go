@@ -62,6 +62,27 @@ func TestReviewRetriesOnParseFailure(t *testing.T) {
 	}
 }
 
+func TestReviewCheckpointDoesNotReplayRejectedOutput(t *testing.T) {
+	var calls atomic.Int32
+	client := newLLM(t, func(w http.ResponseWriter, _ *http.Request) {
+		content := "[]"
+		if calls.Add(1) == 1 {
+			content = "[truncated"
+		}
+		_ = json.NewEncoder(w).Encode(chatResp(content))
+	})
+	a := NewSecurity(client, 1, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx := llm.WithCheckpoint(context.Background(), t.TempDir(), "gvs/source/target")
+	res := a.Review(ctx, Task{Model: "m", Diff: "diff"})
+	if res.Err != nil || calls.Load() != 2 {
+		t.Fatalf("parse retry replayed invalid checkpoint: calls=%d err=%v", calls.Load(), res.Err)
+	}
+	res = a.Review(ctx, Task{Model: "m", Diff: "diff"})
+	if res.Err != nil || calls.Load() != 2 || res.Usage.TotalTokens != 0 {
+		t.Fatalf("successful review not reused: calls=%d usage=%+v err=%v", calls.Load(), res.Usage, res.Err)
+	}
+}
+
 func TestReviewFailsAfterRetryExhausted(t *testing.T) {
 	var calls int32
 	client := newLLM(t, func(w http.ResponseWriter, _ *http.Request) {

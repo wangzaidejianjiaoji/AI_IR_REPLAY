@@ -1,20 +1,13 @@
 <#
 .SYNOPSIS
-单个审核实例的守护脚本，通常由 start-persistent.ps1 后台启动。
-
-.PARAMETER Instance
-必填：gvs 或 gvs-infer。分别加载 configs/config-gvs.yaml 和
-configs/config-gvs-infer.yaml，监听本机 8081 和 8082 端口。
-
+单实例定时审核守护循环；通常由 start-persistent.ps1 后台启动。
 .EXAMPLE
-# 前台运行 GVS 守护循环；后台运行请使用 start-persistent.ps1。
-.\run-persistent.ps1 -Instance gvs
-
+.\run-persistent.ps1 -Instance gvs          # 前台守护 GVS
+.\run-persistent.ps1 -Instance gvs-infer    # 前台守护 infer
 .NOTES
-凭据从 %LOCALAPPDATA%\AI_IR_REPLAY\runtime-env.ps1 加载。
-日志写入项目 data\runtime；审核进程退出后等待 15 秒重新启动。
-文件锁阻止同一用户重复启动相同实例。
-停止守护进程后需同时结束其审核子进程，才能完全停止服务。
+加载 configs/config-<实例>.yaml 和本机 %LOCALAPPDATA%\AI_IR_REPLAY\runtime-env.ps1。
+文件锁防重复启动；审核进程退出后 15 秒重启，日志在 data/runtime。
+停止时先结束本守护进程，再结束审核子进程；手动指定 MR 请用 start-persistent.ps1。
 #>
 param([Parameter(Mandatory=$true)][ValidateSet('gvs','gvs-infer')][string]$Instance)
 $ErrorActionPreference = 'Stop'

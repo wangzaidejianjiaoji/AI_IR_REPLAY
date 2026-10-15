@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,12 +20,13 @@ import (
 
 // Client kimi API 客户端。
 type Client struct {
-	cfg       config.LLMConfig
-	http      *http.Client
-	logger    *slog.Logger
+	cfg    config.LLMConfig
+	http   *http.Client
+	logger *slog.Logger
 	// 备用模型相关
 	fallbackClient *Client // 备用模型客户端
 	isFallback     bool    // 标记当前是否是备用客户端（避免递归创建）
+	quota          quotaGuard
 }
 
 // Message 对话消息。
@@ -74,9 +76,9 @@ func New(cfg config.LLMConfig, logger *slog.Logger) *Client {
 	}
 
 	client := &Client{
-		cfg:    cfg,
-		http:   &http.Client{Timeout: cfg.TimeoutDuration()},
-		logger: logger,
+		cfg:        cfg,
+		http:       &http.Client{Timeout: cfg.TimeoutDuration()},
+		logger:     logger,
 		isFallback: false,
 	}
 
@@ -111,14 +113,35 @@ func (c *Client) SelectModel(changedLines int) string {
 }
 
 // Chat 调用 Chat Completions 接口，带指数退避重试。
-// 当主模型遇到限额错误(429)时，自动切换到备用模型。
+// 主模型遇到额度/速率限额时使用备用模型，并复用当前版本的成功检查点。
 func (c *Client) Chat(ctx context.Context, model string, messages []Message) (string, Usage, error) {
+	if err := ctx.Err(); err != nil {
+		return "", Usage{}, err
+	}
+	path, key := c.checkpointPath(ctx, model, messages)
+	if saved, ok := readResponse(path, key); ok {
+		c.logger.Info("复用已保存模型结果", "model", model, "checkpoint", key)
+		// Replayed work incurs no new HTTP attempt or round token reservation.
+		return saved.Content, Usage{}, nil
+	}
 	result, usage, err := c.chatWithFallback(ctx, model, messages, false)
+	if err == nil && path != "" && strings.TrimSpace(result) != "" {
+		entry := savedResponse{Version: 1, Key: key, Content: result, ContentHash: digest([]byte(result)), OriginalUsage: usage}
+		if saveErr := writeCheckpoint(path, entry); saveErr != nil {
+			c.logger.Warn("保存模型检查点失败", "error", saveErr)
+		}
+	}
 	return result, usage, err
 }
 
 // chatWithFallback 内部方法，支持主备切换
 func (c *Client) chatWithFallback(ctx context.Context, model string, messages []Message, isFallbackMode bool) (string, Usage, error) {
+	if blocked := c.blockedQuota(ctx); blocked != nil {
+		if c.fallbackClient != nil && !isFallbackMode && !c.isFallback {
+			return c.callFallback(ctx, model, messages, blocked)
+		}
+		return "", Usage{}, blocked
+	}
 	var lastErr error
 	for attempt := 1; attempt <= c.cfg.Retry.MaxAttempts; attempt++ {
 		if err := reserveRequest(ctx, model, messages, c.cfg.MaxTokens); err != nil {
@@ -129,24 +152,14 @@ func (c *Client) chatWithFallback(ctx context.Context, model string, messages []
 			return content, usage, nil
 		}
 		lastErr = err
+		var quota *QuotaError
+		if errors.As(err, &quota) {
+			c.rememberQuota(ctx, quota)
+		}
 
-		// 检查是否为限额错误（429），且存在备用客户端且未处于备用模式
+		// 额度/速率限额优先切换备用客户端，不继续重试被限额的供应商。
 		if c.isRateLimitError(err) && c.fallbackClient != nil && !isFallbackMode && !c.isFallback {
-			c.logger.Warn("主模型触发限额，切换到备用模型",
-				"model", model, "error", err.Error())
-
-			// 使用备用模型映射（将主模型映射到对应的备用模型）
-			fallbackModel := c.getFallbackModel(model)
-
-			// 调用备用客户端
-			fallbackContent, fallbackUsage, fallbackErr := c.fallbackClient.chatWithFallback(ctx, fallbackModel, messages, true)
-			if fallbackErr != nil {
-				c.logger.Error("备用模型调用失败", "model", fallbackModel, "error", fallbackErr.Error())
-				return "", Usage{}, fmt.Errorf("主模型和备用模型均失败: 主模型错误=%w, 备用模型错误=%v", lastErr, fallbackErr)
-			}
-
-			c.logger.Info("备用模型调用成功", "model", fallbackModel)
-			return fallbackContent, fallbackUsage, nil
+			return c.callFallback(ctx, model, messages, err)
 		}
 
 		if !retryable || attempt == c.cfg.Retry.MaxAttempts {
@@ -162,6 +175,16 @@ func (c *Client) chatWithFallback(ctx context.Context, model string, messages []
 		}
 	}
 	return "", Usage{}, lastErr
+}
+
+func (c *Client) callFallback(ctx context.Context, model string, messages []Message, cause error) (string, Usage, error) {
+	fallbackModel := c.getFallbackModel(model)
+	c.logger.Warn("主模型限额期间使用备用模型", "model", model, "error", cause)
+	content, usage, err := c.fallbackClient.chatWithFallback(ctx, fallbackModel, messages, true)
+	if err != nil {
+		return "", usage, fmt.Errorf("主模型和备用模型均失败: 主模型错误=%w, 备用模型错误=%w", cause, err)
+	}
+	return content, usage, nil
 }
 
 // chatOnce 单次请求；返回 retryable 标记（5xx/429/网络错误可重试）。
@@ -197,6 +220,12 @@ func (c *Client) chatOnce(ctx context.Context, model string, messages []Message)
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		if quota := classifyQuota(resp, body, time.Now()); quota != nil {
+			if c.cfg.APIKey != "" {
+				quota.Message = strings.ReplaceAll(quota.Message, c.cfg.APIKey, "<REDACTED>")
+			}
+			return "", Usage{}, false, quota
+		}
 		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
 		return "", Usage{}, retryable,
 			fmt.Errorf("llm status %d: %s", resp.StatusCode, truncate(string(body), 500))
@@ -239,16 +268,10 @@ func truncate(s string, n int) string {
 	return s[:n] + "..."
 }
 
-// isRateLimitError 检查是否为限额错误（429）
+// isRateLimitError checks typed provider quota errors rather than body substrings.
 func (c *Client) isRateLimitError(err error) bool {
-	if err == nil {
-		return false
-	}
-	// 检查错误消息中是否包含 429 状态码
-	errStr := err.Error()
-	return strings.Contains(errStr, "429") ||
-		strings.Contains(errStr, "rate limit") ||
-		strings.Contains(errStr, "quota")
+	var quota *QuotaError
+	return errors.As(err, &quota)
 }
 
 // getFallbackModel 将主模型映射到备用模型

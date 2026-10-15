@@ -59,7 +59,8 @@ func (a *Analyzer) Analyze(ctx context.Context, in Input) (ChangeContext, llm.Us
 	}
 	user += "\n## 最新全局代码理解\n" + in.GlobalUnderstanding
 	user += "\n\n## 当前 Diff\n```diff\n" + in.Diff + "\n```"
-	content, usage, err := a.client.Chat(ctx, in.Model, []llm.Message{{Role: "system", Content: system}, {Role: "user", Content: user}})
+	messages := []llm.Message{{Role: "system", Content: system}, {Role: "user", Content: user}}
+	content, usage, err := a.client.Chat(ctx, in.Model, messages)
 	if err != nil {
 		return ChangeContext{}, usage, fmt.Errorf("调用全局理解模型: %w", err)
 	}
@@ -79,6 +80,7 @@ func (a *Analyzer) Analyze(ctx context.Context, in Input) (ChangeContext, llm.Us
 	}
 	var out ChangeContext
 	if err := json.Unmarshal([]byte(text), &out); err != nil {
+		llm.InvalidateCheckpoint(ctx, a.client, in.Model, messages)
 		return ChangeContext{}, usage, fmt.Errorf("解析全局理解模型输出: %w (raw 头 500 字=%s)", err, truncateForLog(content, 500))
 	}
 	return out, usage, nil

@@ -35,6 +35,12 @@ codeup:
   commit_comment: true
 `
 
+func TestLoadReviewCheckpointDirectory(t *testing.T) {
+ cfg,err:=Load(writeConfig(t,codeupYAML+"\nreview:\n  checkpoint_dir: ./data/review-checkpoints\n"))
+ if err!=nil { t.Fatal(err) }
+ if cfg.Review.CheckpointDir!="./data/review-checkpoints" { t.Fatalf("checkpoint directory=%q",cfg.Review.CheckpointDir) }
+}
+
 func TestLoadCodeupDefaults(t *testing.T) {
 	cfg, err := Load(writeConfig(t, codeupYAML))
 	if err != nil {

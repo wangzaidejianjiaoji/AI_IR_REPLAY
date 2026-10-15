@@ -5,6 +5,7 @@
 //	gvs-pr-agent -config configs/config.yaml            # 常驻运行（每分钟轮询）
 //	gvs-pr-agent -config configs/config.yaml -once      # 只跑一轮后退出
 //	gvs-pr-agent -config configs/config.yaml -dry-run   # 只审查不发布评论
+//	gvs-pr-agent -config configs/config.yaml -repo <仓库全路径> -mr <编号> # 手动指定单个 Codeup MR
 //	gvs-pr-agent -rule my-rules.yaml ...                # CLI 指定规则文档（四层链最高优先级）
 //	gvs-pr-agent -diff my.patch -dry-run                # 审查本地 diff 文件（不依赖 GitHub）
 package main
@@ -30,13 +31,33 @@ import (
 
 func main() {
 	var (
-		configPath = flag.String("config", defaultConfigPath(), "配置文件路径")
-		dryRun     = flag.Bool("dry-run", false, "只审查不发布评论")
-		once       = flag.Bool("once", false, "只执行一轮审查后退出")
-		diffFile   = flag.String("diff", "", "审查本地 diff 文件（调试用，不访问 GitHub）")
-		rulePath   = flag.String("rule", "", "规则文档路径（四层优先级链的最高层，覆盖配置文件）")
+		configPath    = flag.String("config", defaultConfigPath(), "配置文件路径")
+		dryRun        = flag.Bool("dry-run", false, "只审查不发布评论")
+		once          = flag.Bool("once", false, "只执行一轮审查后退出")
+		diffFile      = flag.String("diff", "", "审查本地 diff 文件（调试用，不访问 GitHub）")
+		rulePath      = flag.String("rule", "", "规则文档路径（四层优先级链的最高层，覆盖配置文件）")
+		repository    = flag.String("repo", "", "精准审查的 Codeup 仓库（必须已配置，与 -mr 配对）")
+		mrID          = flag.Int("mr", 0, "精准审查的 Codeup MR 正整数 ID（与 -repo 配对，单次执行）")
+		checkpointDir = flag.String("checkpoint-dir", "", "覆盖 review.checkpoint_dir，复用 MR 审查检查点")
 	)
 	flag.Parse()
+	var repoSet, mrSet bool
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "repo" {
+			repoSet = true
+		}
+		if f.Name == "mr" {
+			mrSet = true
+		}
+	})
+	if repoSet != mrSet || (mrSet && *mrID <= 0) {
+		fmt.Fprintln(os.Stderr, "-repo 与 -mr 必须成对指定，MR ID 必须为正整数")
+		os.Exit(1)
+	}
+	if err := validateFocusedFlags(*repository, *mrID, *diffFile); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -46,6 +67,11 @@ func main() {
 	if *dryRun {
 		cfg.Review.DryRun = true
 	}
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "checkpoint-dir" {
+			cfg.Review.CheckpointDir = *checkpointDir
+		}
+	})
 	if err := cfg.ValidateRuntime(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -113,6 +139,16 @@ func main() {
 		return
 	}
 
+	// 手动选择只在本次进程生效，不改变定时扫描配置或保存为长期筛选条件。
+	if *repository != "" {
+		if err := svc.ReviewCodeupMR(ctx, *repository, *mrID); err != nil {
+			log.Error("指定 MR 审查失败", "repo", *repository, "mr", *mrID, "error", err.Error())
+			os.Exit(1)
+		}
+		log.Info("指定 MR 审查完成，退出", "repo", *repository, "mr", *mrID)
+		return
+	}
+
 	// 模式 2：只跑一轮
 	if *once {
 		svc.RunOnce(ctx)
@@ -124,6 +160,19 @@ func main() {
 	sched := scheduler.New(cfg.Scheduler.IntervalDuration(), cfg.Scheduler.JitterDuration(), log)
 	startAdminServer(cfg.Server.Addr, cfg.Server.AdminToken, sched, log)
 	sched.Run(ctx, svc.RunOnce)
+}
+
+func validateFocusedFlags(repository string, localID int, diffFile string) error {
+	if repository == "" && localID == 0 {
+		return nil
+	}
+	if strings.TrimSpace(repository) == "" || repository != strings.TrimSpace(repository) || localID <= 0 {
+		return fmt.Errorf("-repo 与 -mr 必须成对指定，仓库不能为空且 MR ID 必须为正整数")
+	}
+	if diffFile != "" {
+		return fmt.Errorf("-repo/-mr 不能与 -diff 同时使用")
+	}
+	return nil
 }
 
 // startAdminServer 启动管理 HTTP 服务：GET /health 健康检查、POST /trigger 手动触发。
