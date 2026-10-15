@@ -1,6 +1,6 @@
 # AI_IR_REPLAY：AI 代码审查项目说明与实施边界
 
-> 文档维护日期：2026-10-15。实现依据：当前检出提交 cbfa453c（核对开始时工作区干净）。本次重新核对源码、配置与启动脚本，并执行禁用测试缓存的全量测试，结果通过；历史知识来源隔离失败及当前修复状态见第 8 节。本文区分实现、测试结果和建议，不代表真实模型、平台评论或线上部署已验收。
+> 文档维护日期：2026-10-15。实现依据：提交 cbfa453c 及本次新增的未提交启停管理改动。已核对源码、配置与启动脚本，并执行禁用测试缓存的全量测试；历史知识来源隔离失败及当前修复状态见第 8 节。启停管理的操作与隔离测试见 [常驻审核一键启停](docs/persistent-control.md)。本文区分实现、测试结果和建议，不代表真实模型、平台评论或线上部署已验收。
 
 ## 1. 项目定位与阅读入口
 
@@ -164,6 +164,8 @@ GVS 与 gvs_infer 是被审查的业务仓库，不是审查服务的运行依�
 当前 Docker Compose（容器组合部署工具）挂载 configs:ro（配置目录只读）、data（状态数据目录）、docs（知识与文档目录），并传递 Codeup 凭据；宿主端口只绑定 127.0.0.1。容器管理地址通过 AGENT_SERVER_ADDR=0.0.0.0:8081 覆盖，启动要求 AGENT_ADMIN_TOKEN。Compose 默认通过 AGENT_REVIEW_DRY_RUN=true 覆盖配置以禁止发布；当前未传递 GVS/infer 备用模型配置引用的 MiniMax_API_KEY，若选择这些配置并需要备用模型，须补齐凭据传入。首次知识初始化还需本地 Git 对象和 snapshot_repository，现有 Compose 未挂载业务 Git 仓库；不能仅凭配置文件存在认定部署完成。具体步骤见部署与验收文档。
 
 Windows/Linux 的 start-persistent.ps1、start-persistent.sh 支持 scheduled（后台定时）和 manual（前台单次指定 MR）模式。定时默认启动 GVS 与 infer，审核子进程退出后由 run-persistent 脚本间隔 15 秒重启；手动必须选单个实例，并先停止对应守护与审核进程，遇到锁占用会退出。Windows 依赖已构建二进制和外部 runtime-env.ps1；Linux 依赖 Bash、flock，定时模式另需 nohup，无可执行二进制时尝试用 Go 构建。脚本不会证明现有二进制与当前源码一致。
+
+原名称入口另支持 action=start/stop/restart/status，默认仍为 start；status/stop 无需模型凭据，restart 在确认实例退出后再调用原启动路径。共用的 Go 启停逻辑按项目和配置实例核对进程，先停守护再停审核，不删除基线或锁文件。可构建独立的 bin/start-persistent[.exe] 管理旧实例，避免覆盖运行中的审核二进制。完整命令、构建前提及原有指定 MR 参数见 [常驻审核一键启停](docs/persistent-control.md)。
 
 单次指定 MR 的 CLI 示例（替换编号；此命令仅供操作参考，本次未执行）：
 

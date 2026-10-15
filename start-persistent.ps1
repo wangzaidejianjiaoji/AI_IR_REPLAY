@@ -6,6 +6,9 @@
 .\start-persistent.ps1 -Mode scheduled -Instance gvs              # 定时：仅 GVS
 .\start-persistent.ps1 -Instance gvs-infer                         # 定时：仅 infer
 .\start-persistent.ps1 -Mode manual -Instance gvs -MR 123 -DryRun   # 手动：替换编号；移除 -DryRun 发布评论
+.\start-persistent.ps1 -Action status                            # 检查全部实例
+.\start-persistent.ps1 -Action stop -Instance gvs                 # 停止 GVS 守护与审核进程
+.\start-persistent.ps1 -Action restart -Instance gvs-infer         # 重启 infer
 .NOTES
 在项目目录运行。手动模式必须选单个实例；先停止其守护进程和审核进程。
 可选 -Repo <配置内仓库全路径>、-CheckpointDir <目录>；默认检查点为 data/checkpoints/<实例>。
@@ -22,10 +25,22 @@ param(
     [int]$MR,
     [string]$Repo,
     [switch]$DryRun,
-    [string]$CheckpointDir
+    [string]$CheckpointDir,
+    [ValidateSet('start', 'stop', 'restart', 'status')]
+    [string]$Action = 'start'
 )
 
 $ErrorActionPreference = 'Stop'
+if ($Action -ne 'start') {
+    foreach ($reviewOption in @('Mode', 'MR', 'Repo', 'DryRun', 'CheckpointDir')) {
+        if ($PSBoundParameters.ContainsKey($reviewOption)) { throw "-$reviewOption cannot be combined with -Action $Action." }
+    }
+    $controller = Join-Path $PSScriptRoot 'bin\start-persistent.exe'
+    if (-not (Test-Path -LiteralPath $controller -PathType Leaf)) { $controller = Join-Path $PSScriptRoot 'bin\gvs-pr-agent.exe' }
+    if (-not (Test-Path -LiteralPath $controller -PathType Leaf)) { throw 'Build bin/start-persistent.exe from ./cmd/agent before managing instances.' }
+    & $controller -action $Action -instance $Instance
+    exit $LASTEXITCODE
+}
 if ($Mode -eq 'manual') {
     if ($Instance -eq 'all' -or $MR -le 0) {
         throw 'Manual mode requires -Instance gvs|gvs-infer and -MR <positive integer>.'

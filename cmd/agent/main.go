@@ -18,12 +18,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"gvs-pr-agent/internal/config"
 	"gvs-pr-agent/internal/instance"
+	"gvs-pr-agent/internal/lifecycle"
 	"gvs-pr-agent/internal/logger"
 	"gvs-pr-agent/internal/review"
 	"gvs-pr-agent/internal/scheduler"
@@ -39,8 +41,37 @@ func main() {
 		repository    = flag.String("repo", "", "精准审查的 Codeup 仓库（必须已配置，与 -mr 配对）")
 		mrID          = flag.Int("mr", 0, "精准审查的 Codeup MR 正整数 ID（与 -repo 配对，单次执行）")
 		checkpointDir = flag.String("checkpoint-dir", "", "覆盖 review.checkpoint_dir，复用 MR 审查检查点")
+		action        = flag.String("action", "", "实例管理：start/stop/restart/status，不执行配置扫描")
+		instanceName  = flag.String("instance", "all", "管理实例：all/gvs/gvs-infer")
 	)
 	flag.Parse()
+	if *action != "" {
+		var invalid string
+		flag.Visit(func(f *flag.Flag) {
+			if f.Name != "action" && f.Name != "instance" {
+				invalid = f.Name
+			}
+		})
+		if invalid != "" || flag.NArg() != 0 {
+			fmt.Fprintln(os.Stderr, "-action 仅允许配合 -instance 使用；指定 MR 请沿用 -repo/-mr")
+			os.Exit(1)
+		}
+		executable, err := os.Executable()
+		if err == nil {
+			err = lifecycle.Run(filepath.Dir(filepath.Dir(executable)), *action, *instanceName, os.Stdout)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "instance" {
+			fmt.Fprintln(os.Stderr, "-instance 必须与 -action 配合使用")
+			os.Exit(1)
+		}
+	})
 	var repoSet, mrSet bool
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "repo" {

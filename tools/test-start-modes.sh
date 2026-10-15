@@ -30,6 +30,15 @@ export KIMI_API_KEY=mock CODEUP_TOKEN=mock CODEUP_ORG_ID=mock
 export AI_IR_RUNTIME_ENV="$temp/credentials.sh"
 touch "$AI_IR_RUNTIME_ENV"
 export TEST_ARGS_FILE="$temp/args.txt" TEST_EXIT_CODE=42
+mv "$AI_IR_RUNTIME_ENV" "$temp/credentials.saved"
+for action in stop status restart; do
+    status=0
+    bash "$fixture/start-persistent.sh" gvs --action "$action" || status=$?
+    [[ $status == 42 ]] || { echo "FAIL: action routing $action: $status" >&2; exit 1; }
+    printf '%s\n' -action "$action" -instance gvs > "$temp/want.txt"
+    diff -u "$temp/want.txt" "$TEST_ARGS_FILE"
+done
+mv "$temp/credentials.saved" "$AI_IR_RUNTIME_ENV"
 status=0
 bash "$fixture/start-persistent.sh" gvs --mode manual --mr 27 --dry-run --checkpoint-dir 'data/checkpoints with spaces' || status=$?
 [[ $status == 42 ]] || { echo "FAIL: manual exit code $status != 42" >&2; exit 1; }
@@ -40,7 +49,7 @@ export TEST_EXIT_CODE=0
 bash "$fixture/start-persistent.sh" --mode manual gvs-infer --mr 81 --repo other/configured-repository
 printf '%s\n' -config configs/config-gvs-infer.yaml -repo other/configured-repository -mr 81 -checkpoint-dir data/checkpoints/gvs-infer > "$temp/want.txt"
 diff -u "$temp/want.txt" "$TEST_ARGS_FILE"
-for invalid in missing-instance missing-mr negative-mr scheduled-mr scheduled-dry-run scheduled-checkpoint unknown; do
+for invalid in missing-instance missing-mr negative-mr scheduled-mr scheduled-dry-run scheduled-checkpoint unknown invalid-action stop-mr status-mode; do
     case "$invalid" in
         missing-instance) args=(--mode manual --mr 27) ;;
         missing-mr) args=(gvs --mode manual) ;;
@@ -49,6 +58,9 @@ for invalid in missing-instance missing-mr negative-mr scheduled-mr scheduled-dr
         scheduled-dry-run) args=(gvs --dry-run) ;;
         scheduled-checkpoint) args=(gvs --checkpoint-dir data/cache) ;;
         unknown) args=(gvs --invalid) ;;
+        invalid-action) args=(gvs --action delete) ;;
+        stop-mr) args=(gvs --action stop --mr 27) ;;
+        status-mode) args=(gvs --action status --mode scheduled) ;;
     esac
     rm -f "$TEST_ARGS_FILE"
     if bash "$fixture/start-persistent.sh" "${args[@]}" >/dev/null 2>&1; then echo "FAIL: accepted $invalid" >&2; exit 1; fi
@@ -59,4 +71,4 @@ bash "$fixture/start-persistent.sh"
 sort "$fixture/scheduled.txt" > "$temp/actual.txt"
 printf '%s\n' gvs gvs-infer > "$temp/want.txt"
 diff -u "$temp/want.txt" "$temp/actual.txt"
-echo 'PASS: manual routing, arguments with spaces, exit code, invalid input, default scheduled launch.'
+echo 'PASS: lifecycle routing without credentials, manual arguments, exit codes, invalid input, default scheduled launch.'

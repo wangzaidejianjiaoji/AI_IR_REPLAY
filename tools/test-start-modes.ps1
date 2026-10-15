@@ -25,18 +25,31 @@ func main(){b,_:=json.Marshal(os.Args[1:]);os.WriteFile(os.Getenv("TEST_ARGS_FIL
     $env:TEST_EXIT_CODE = '42'
     $shell = "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe"
     function Invoke-Launcher([string[]]$Options) {
-        & $shell -NoProfile -ExecutionPolicy Bypass -File "$fixture/start-persistent.ps1" @Options *> $null
-        return $LASTEXITCODE
+        $savedPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            & $shell -NoProfile -ExecutionPolicy Bypass -File "$fixture/start-persistent.ps1" @Options *> $null
+            return $LASTEXITCODE
+        } finally { $ErrorActionPreference = $savedPreference }
     }
+    # stop/status must route before credentials are read and preserve exit codes.
+    Move-Item "$fixture/local/AI_IR_REPLAY/runtime-env.ps1" "$fixture/credentials.saved"
+    foreach ($action in @('stop', 'status', 'restart')) {
+        if ((Invoke-Launcher @('-Action', $action, '-Instance', 'gvs')) -ne 42) { throw "action routing failed: $action" }
+        $actual = Get-Content "$fixture/args.json" -Raw | ConvertFrom-Json
+        $want = @('-action', $action, '-instance', 'gvs')
+        if (($actual -join '|') -ne ($want -join '|')) { throw "action arguments mismatch: $actual" }
+    }
+    Move-Item "$fixture/credentials.saved" "$fixture/local/AI_IR_REPLAY/runtime-env.ps1"
     $status = Invoke-Launcher @('-Mode','manual','-Instance','gvs','-MR','27','-DryRun','-CheckpointDir','data/checkpoints with spaces')
     if ($status -ne 42) { throw "manual exit code: $status (expected 42)" }
-    $actual = @(Get-Content "$fixture/args.json" -Raw | ConvertFrom-Json)
+    $actual = Get-Content "$fixture/args.json" -Raw | ConvertFrom-Json
     $want = @('-config','configs/config-gvs.yaml','-repo','lizheng/lzvsg/gvs','-mr','27','-checkpoint-dir','data/checkpoints with spaces','-dry-run')
     if (($actual -join '|') -ne ($want -join '|')) { throw "manual argument mismatch: $actual" }
     if (Test-Path "$fixture/scheduled-*.txt") { throw 'manual mode started a supervisor' }
     $env:TEST_EXIT_CODE = '0'
     if ((Invoke-Launcher @('-Mode','manual','-Instance','gvs-infer','-MR','81')) -ne 0) { throw 'manual success exit code lost' }
-    $actual = @(Get-Content "$fixture/args.json" -Raw | ConvertFrom-Json)
+    $actual = Get-Content "$fixture/args.json" -Raw | ConvertFrom-Json
     $want = @('-config','configs/config-gvs-infer.yaml','-repo','lizheng/lzvsg/gvs_infer','-mr','81','-checkpoint-dir','data/checkpoints/gvs-infer')
     if (($actual -join '|') -ne ($want -join '|')) { throw "infer argument mismatch: $actual" }
     foreach ($options in @(
@@ -47,7 +60,9 @@ func main(){b,_:=json.Marshal(os.Args[1:]);os.WriteFile(os.Getenv("TEST_ARGS_FIL
         @('-Mode','scheduled','-DryRun'),
         @('-Mode','scheduled','-Repo','other/repo'),
         @('-Mode','scheduled','-CheckpointDir','data/cache'),
-        @('-UnknownOption','manual')
+        @('-UnknownOption','manual'),
+        @('-Action','stop','-Mode','manual','-Instance','gvs','-MR','27'),
+        @('-Action','status','-Repo','other/repo')
     )) {
         Remove-Item "$fixture/args.json" -ErrorAction SilentlyContinue
         if ((Invoke-Launcher $options) -eq 0) { throw "invalid selection accepted: $options" }
@@ -65,7 +80,7 @@ func main(){b,_:=json.Marshal(os.Args[1:]);os.WriteFile(os.Getenv("TEST_ARGS_FIL
         Start-Sleep -Milliseconds 100
     }
     if (-not ((Test-Path "$fixture/scheduled-gvs.txt") -and (Test-Path "$fixture/scheduled-gvs-infer.txt"))) { throw 'default no longer starts both scheduled instances' }
-    Write-Output 'PASS: manual routing, arguments with spaces, exit code, invalid input, lock exclusion, default scheduled launch.'
+    Write-Output 'PASS: lifecycle routing without credentials, manual arguments, exit codes, invalid input, lock exclusion, default scheduled launch.'
 } finally {
     $env:LOCALAPPDATA = $previousLocal
     $env:TEST_ARGS_FILE = $previousArgs
