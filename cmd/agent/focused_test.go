@@ -43,18 +43,21 @@ func TestValidateFocusedFlags(t *testing.T) {
 	for _, test := range []struct {
 		name, repo, diff string
 		id               int
+		repoSet, mrSet   bool
 		wantError        bool
 	}{
-		{"default", "", "", 0, false},
-		{"focused", "lzvsg/gvs", "", 8, false},
-		{"repo-only", "lzvsg/gvs", "", 0, true},
-		{"mr-only", "", "", 8, true},
-		{"negative-mr", "lzvsg/gvs", "", -1, true},
-		{"diff-conflict", "lzvsg/gvs", "local.patch", 8, true},
-		{"whitespace-repo", " ", "", 8, true},
+		{"default", "", "", 0, false, false, false},
+		{"focused", "lzvsg/gvs", "", 8, true, true, false},
+		{"repo-only", "lzvsg/gvs", "", 0, true, false, true},
+		{"mr-only", "", "", 8, false, true, true},
+		{"mr-zero", "", "", 0, false, true, true},
+		{"repo-only-mr-zero", "lzvsg/gvs", "", 0, true, true, true},
+		{"negative-mr", "lzvsg/gvs", "", -1, true, true, true},
+		{"diff-conflict", "lzvsg/gvs", "local.patch", 8, true, true, true},
+		{"whitespace-repo", " ", "", 8, true, true, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if err := validateFocusedFlags(test.repo, test.id, test.diff); (err != nil) != test.wantError {
+			if err := validateFocusedFlags(test.repo, test.id, test.diff, test.repoSet, test.mrSet); (err != nil) != test.wantError {
 				t.Fatalf("error=%v wantError=%v", err, test.wantError)
 			}
 		})

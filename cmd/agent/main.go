@@ -50,11 +50,7 @@ func main() {
 			mrSet = true
 		}
 	})
-	if repoSet != mrSet || (mrSet && *mrID <= 0) {
-		fmt.Fprintln(os.Stderr, "-repo 与 -mr 必须成对指定，MR ID 必须为正整数")
-		os.Exit(1)
-	}
-	if err := validateFocusedFlags(*repository, *mrID, *diffFile); err != nil {
+	if err := validateFocusedFlags(*repository, *mrID, *diffFile, repoSet, mrSet); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -162,7 +158,10 @@ func main() {
 	sched.Run(ctx, svc.RunOnce)
 }
 
-func validateFocusedFlags(repository string, localID int, diffFile string) error {
+func validateFocusedFlags(repository string, localID int, diffFile string, repoSet, mrSet bool) error {
+	if repoSet != mrSet {
+		return fmt.Errorf("-repo 与 -mr 必须成对指定，MR ID 必须为正整数")
+	}
 	if repository == "" && localID == 0 {
 		return nil
 	}
