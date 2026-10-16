@@ -81,6 +81,9 @@ agents:
   dataflow:    { enabled: true, priority: 1 }
 
 review:
+  # 与 GVS 共用执行锁、队列和账户冷却；结果按任务身份隔离。
+  runtime_dir: "./data/review-runtime"
+  checkpoint_dir: "./data/checkpoints"
   max_llm_calls: 600
   max_round_tokens: 12000000 # 保守输入/输出预留预算，不等于实际账单 Token
   round_timeout: "60m"

@@ -248,6 +248,10 @@ func (c *Coordinator) aggregate(results []agent.Result, pkgs []packager.Package,
 	}
 	sum.TotalAgents = len(c.agents) // 已启用总数（供报告展示“参与 N/M”）
 
+	sort.Strings(sum.AgentNames)
+	sort.Strings(sum.FailedRoles)
+	sortIssues(all)
+
 	// 【确定性工程】评论定位：文件与行号校验（过滤幻觉文件、修正偏移行号）
 	if c.loc != nil {
 		var dropped int
@@ -262,14 +266,7 @@ func (c *Coordinator) aggregate(results []agent.Result, pkgs []packager.Package,
 		sum.Dropped += dropped
 	}
 
-	// 按严重度降序、文件路径升序排序
-	sort.SliceStable(all, func(i, j int) bool {
-		ri, rj := agent.SeverityRank(all[i].Severity), agent.SeverityRank(all[j].Severity)
-		if ri != rj {
-			return ri > rj
-		}
-		return all[i].File < all[j].File
-	})
+	sortIssues(all)
 	sum.Issues = all
 	return sum
 }

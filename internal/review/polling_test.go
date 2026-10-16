@@ -44,7 +44,9 @@ func TestPollingDoesNotDuplicateActiveReview(t *testing.T) {
 				gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					switch {
 					case strings.HasSuffix(r.URL.Path, "/pulls"):
-						_, _ = w.Write([]byte(`[{"number":1,"title":"fix","head":{"sha":"sha1"},"base":{"ref":"main"}}]`))
+						_, _ = w.Write([]byte(`[{"number":1,"title":"fix","head":{"sha":"sha1"},"base":{"sha":"base1","ref":"main"}}]`))
+					case strings.HasSuffix(r.URL.Path, "/pulls/1"):
+						_, _ = w.Write([]byte(`{"number":1,"title":"fix","state":"open","head":{"sha":"sha1"},"base":{"sha":"base1","ref":"main"}}`))
 					case strings.HasSuffix(r.URL.Path, "/comments"):
 						_, _ = w.Write([]byte("[]"))
 					default:
@@ -99,7 +101,9 @@ func TestPollingRetriesPRWhenDiffConflictResolves(t *testing.T) {
 	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/pulls"):
-			_, _ = w.Write([]byte(`[{"number":1,"title":"fix","head":{"sha":"sha1"},"base":{"ref":"main"}}]`))
+			_, _ = w.Write([]byte(`[{"number":1,"title":"fix","head":{"sha":"sha1"},"base":{"sha":"base1","ref":"main"}}]`))
+		case strings.HasSuffix(r.URL.Path, "/pulls/1"):
+			_, _ = w.Write([]byte(`{"number":1,"title":"fix","state":"open","head":{"sha":"sha1"},"base":{"sha":"base1","ref":"main"}}`))
 		case strings.HasSuffix(r.URL.Path, "/comments"):
 			_, _ = w.Write([]byte("[]"))
 		default:
@@ -119,6 +123,7 @@ func TestPollingRetriesPRWhenDiffConflictResolves(t *testing.T) {
 	svc := newTestService(t, cfg)
 	svc.RunOnce(context.Background())
 	conflict.Store(false)
+	expireRuntimeRetries(t, svc)
 	svc.RunOnce(context.Background())
 	if *calls != 1 {
 		t.Fatalf("resolved conflict did not retry same version: model calls=%d", *calls)

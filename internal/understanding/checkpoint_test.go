@@ -30,7 +30,7 @@ func TestRejectedKnowledgeResponseIsNotReplayedAfterRestart(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(cfg.DocumentPath), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(cfg.DocumentPath, []byte("<!-- SOURCE-SHA: old -->\n# Previous knowledge"), 0600); err != nil {
+	if err := os.WriteFile(cfg.DocumentPath, []byte("<!-- SOURCE-REPOSITORY: "+cfg.SourceRepository+" -->\n<!-- SOURCE-SHA: old -->\n# Previous knowledge"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	modelCfg := config.LLMConfig{APIKey: "key", BaseURL: srv.URL, Timeout: "2s"}

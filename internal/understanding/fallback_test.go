@@ -28,7 +28,7 @@ func TestPrepareReturnsVersionedOldSnapshotOnFailure(t *testing.T) {
 		t.Run(failure, func(t *testing.T) {
 			cfg := understandingConfig(t)
 			os.MkdirAll(filepath.Dir(cfg.DocumentPath), 0755)
-			old := "<!-- SOURCE-SHA: old -->\n# Known lifecycle"
+			old := "<!-- SOURCE-REPOSITORY: " + cfg.SourceRepository + " -->\n<!-- SOURCE-SHA: old -->\n# Known lifecycle"
 			os.WriteFile(cfg.DocumentPath, []byte(old), 0600)
 			var repo Repository = &fakeRepo{head: "new", diff: "+changed"}
 			var model ChatClient = &fakeModel{}
@@ -63,10 +63,12 @@ func TestBootstrapRefusesUnverifiedSeed(t *testing.T) {
 	}
 }
 
-func TestPrepareRejectsDifferentRepositoryKnowledge(t *testing.T){
-	cfg:=understandingConfig(t)
-	os.MkdirAll(filepath.Dir(cfg.DocumentPath),0755)
-	os.WriteFile(cfg.DocumentPath,[]byte("<!-- SOURCE-REPOSITORY: other/repository -->\n<!-- SOURCE-SHA: same -->\n# foreign"),0600)
-	snap,_,err:=New(cfg,&fakeRepo{head:"same"},&fakeModel{},"seed",nil).Prepare(context.Background(),"model")
-	if err==nil||snap.Document!=""{t.Fatalf("foreign repository snapshot reused: %+v %v",snap,err)}
+func TestPrepareRejectsDifferentRepositoryKnowledge(t *testing.T) {
+	cfg := understandingConfig(t)
+	os.MkdirAll(filepath.Dir(cfg.DocumentPath), 0755)
+	os.WriteFile(cfg.DocumentPath, []byte("<!-- SOURCE-REPOSITORY: other/repository -->\n<!-- SOURCE-SHA: same -->\n# foreign"), 0600)
+	snap, _, err := New(cfg, &fakeRepo{head: "same"}, &fakeModel{}, "seed", nil).Prepare(context.Background(), "model")
+	if err == nil || snap.Document != "" {
+		t.Fatalf("foreign repository snapshot reused: %+v %v", snap, err)
+	}
 }

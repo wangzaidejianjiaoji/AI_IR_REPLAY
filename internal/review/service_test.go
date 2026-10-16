@@ -4,6 +4,7 @@
 //  3. 同一提交去重             4. 失败不推进基线
 //  5. dry_run 双保险           6. 评论回写与 SHA 存证
 //  7. 分支过滤                 8. 原有链路回归（本地 diff）
+//
 // 另覆盖覆盖率拦截：文件数超限时审查失败（不发评论、不推进基线、不调用 LLM）。
 package review
 
@@ -195,6 +196,8 @@ func newMockLLM(t *testing.T) (*httptest.Server, *int) {
 func testConfig(t *testing.T, codeupURL, llmURL string) *config.Config {
 	t.Helper()
 	cfg := &config.Config{}
+	cfg.Review.RuntimeDir = filepath.Join(t.TempDir(), "runtime")
+	cfg.Review.CheckpointDir = filepath.Join(t.TempDir(), "checkpoints")
 	cfg.LLM = config.LLMConfig{
 		APIKey:  "test-key",
 		BaseURL: llmURL,
@@ -347,6 +350,7 @@ func TestFailureKeepsBaseline(t *testing.T) {
 
 	// 故障恢复 -> 下一轮自动重试并推进基线
 	cu.setCompareFail(false)
+	expireRuntimeRetries(t, svc)
 	svc.RunOnce(ctx)
 	if got := baseline(t, cfg.Codeup.StatePath, stateKey); got != "sha-2" {
 		t.Fatalf("恢复后基线 = %q, want sha-2", got)
@@ -648,7 +652,7 @@ func TestMRReviewUsesUnderstandingAndFinalConfirmation(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(cfg.Understanding.DocumentPath), 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(cfg.Understanding.DocumentPath, []byte("<!-- SOURCE-SHA: old-main -->\n# versioned previous knowledge"), 0600); err != nil {
+	if err := os.WriteFile(cfg.Understanding.DocumentPath, []byte("<!-- SOURCE-REPOSITORY: lzvsg/gvs -->\n<!-- SOURCE-SHA: old-main -->\n# versioned previous knowledge"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	svc := newTestService(t, cfg)

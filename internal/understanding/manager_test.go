@@ -80,7 +80,7 @@ func TestPrepareReusesDocumentWhenMainIsUnchanged(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(cfg.DocumentPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(cfg.DocumentPath, []byte("<!-- GVS-SOURCE-SHA: sha-1 -->\n# GVS 全局代码理解"), 0o644); err != nil {
+	if err := os.WriteFile(cfg.DocumentPath, []byte("<!-- SOURCE-REPOSITORY: "+cfg.SourceRepository+" -->\n<!-- GVS-SOURCE-SHA: sha-1 -->\n# GVS 全局代码理解"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	repo := &fakeRepo{head: "sha-1"}
@@ -104,7 +104,7 @@ func TestPrepareUpdatesDocumentOnceWhenMainChanges(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(cfg.DocumentPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(cfg.DocumentPath, []byte("<!-- GVS-SOURCE-SHA: sha-1 -->\n# old"), 0o644); err != nil {
+	if err := os.WriteFile(cfg.DocumentPath, []byte("<!-- SOURCE-REPOSITORY: "+cfg.SourceRepository+" -->\n<!-- GVS-SOURCE-SHA: sha-1 -->\n# old"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	repo := &fakeRepo{

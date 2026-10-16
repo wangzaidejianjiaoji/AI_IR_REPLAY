@@ -8,14 +8,14 @@
 
 | 项 | 值 |
 |---|---|
-| KIMI_API_KEY | `sk-kimi-TROOC1gSqqUeg5UnYLR6mUMgAf2JkPm0NcVbvaNmjwtJhzU35o8BsvZrTkR5CuFl` |
+| KIMI_API_KEY | `${KIMI_API_KEY}` |
 | base_url | `https://api.kimi.com/coding/v1` |
 | 模型 | `kimi-for-coding` |
 ### minimax 本地凭据登记
 
 | 项 | 值 |
 |---|---|
-| MiniMax_API_KEY | `sk-cp-Wi_tEtqP4ieSrjtdVLFsUUnBBLK7XYntn0ezGPBGtDLpR-3mEmo792AgjAv9-mbxo9cnY1oNEhqVxWleaXCvmbDoMK1lrXiQbQIrrRHEt571ggMx38k-UK0` |
+| MiniMax_API_KEY | `${MiniMax_API_KEY}` |
 | base_url | `https://api.minimaxi.com/v1` |
 | 模型 | `MiniMax-M3` |
 

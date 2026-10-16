@@ -13,6 +13,13 @@ import (
 
 type checkpointKey struct{}
 type checkpointScope struct{ directory, identity string }
+type quotaDirectoryKey struct{}
+
+// WithQuotaDirectory shares provider cooldowns independently of response
+// checkpoint scopes. It also works when response checkpoints are disabled.
+func WithQuotaDirectory(ctx context.Context, directory string) context.Context {
+	return context.WithValue(ctx, quotaDirectoryKey{}, strings.TrimSpace(directory))
+}
 
 // WithCheckpoint enables response reuse for one immutable review snapshot.
 // The caller must include repository, source SHA and target SHA in scope.
@@ -29,6 +36,8 @@ type savedResponse struct {
 	Content       string `json:"content"`
 	ContentHash   string `json:"content_hash"`
 	OriginalUsage Usage  `json:"original_usage"`
+	Provider      string `json:"provider,omitempty"`
+	Model         string `json:"model,omitempty"`
 }
 
 func digest(value []byte) string {
@@ -125,12 +134,16 @@ type savedQuota struct {
 
 func (c *Client) quotaPath(ctx context.Context) (string, string) {
 	scope, ok := ctx.Value(checkpointKey{}).(checkpointScope)
-	if !ok {
+	directory, _ := ctx.Value(quotaDirectoryKey{}).(string)
+	if directory == "" && ok {
+		directory = scope.directory
+	}
+	if directory == "" {
 		return "", ""
 	}
 	encoded, _ := json.Marshal([]string{c.cfg.Provider, c.cfg.BaseURL, digest([]byte(c.cfg.APIKey))})
 	identity := digest(encoded)
-	return filepath.Join(scope.directory, "quotas", identity+".json"), identity
+	return filepath.Join(directory, "quotas", identity+".json"), identity
 }
 
 func (c *Client) blockedQuota(ctx context.Context) *QuotaError {
@@ -151,7 +164,7 @@ func (c *Client) blockedQuota(ctx context.Context) *QuotaError {
 	return c.quota.blocked(now)
 }
 
-func (c *Client) rememberQuota(ctx context.Context, quota *QuotaError) {
+func (c *Client) rememberQuota(ctx context.Context, quota *QuotaError) error {
 	// Keep the state merge and disk write in one critical section; otherwise a
 	// slower writer can persist a shorter deadline after the longer response.
 	c.quota.mu.Lock()
@@ -160,7 +173,8 @@ func (c *Client) rememberQuota(ctx context.Context, quota *QuotaError) {
 	path, identity := c.quotaPath(ctx)
 	if path != "" {
 		if err := writeCheckpoint(path, savedQuota{Version: 1, Identity: identity, Quota: *c.quota.err}); err != nil {
-			c.logger.Warn("保存模型限额状态失败", "error", err)
+			return err
 		}
 	}
+	return nil
 }

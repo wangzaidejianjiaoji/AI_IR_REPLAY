@@ -10,6 +10,7 @@ package review
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -84,6 +85,9 @@ type Service struct {
 // NewService 组装审查服务的全部依赖。
 // cliRulePath 为 CLI -rule 参数指定的规则文档（四层优先级链的最高层，可为空）。
 func NewService(cfg *config.Config, cliRulePath string, logger *slog.Logger) (*Service, error) {
+	if cfg.Review.RuntimeDir == "" {
+		cfg.Review.RuntimeDir = "./data/review-runtime"
+	}
 	if err := cfg.ValidateRuntime(); err != nil {
 		return nil, err
 	}
@@ -178,14 +182,14 @@ func (s *Service) StartRuleHotReload(stop <-chan struct{}) {
 
 // RunOnce 执行一轮审查：遍历所有配置仓库的 Open PR，再扫描 Codeup 分支推送。
 func (s *Service) RunOnce(ctx context.Context) {
-	ctx, cancel := s.roundContext(ctx)
-	defer cancel()
 	// 【审查时间窗口】非工作时段跳过本轮（与 GVS 日夜模式对应）
 	if !s.cfg.Review.InActiveHours(time.Now()) {
 		s.logger.Info("当前不在审查时间窗口内，跳过本轮",
 			"start", s.cfg.Review.ActiveHours.Start, "end", s.cfg.Review.ActiveHours.End)
 		return
 	}
+	var candidates []reviewCandidate
+	ctx = context.WithValue(ctx, collectionKey{}, &candidates)
 	for _, repo := range s.cfg.GitHub.Repos {
 		if err := s.reviewRepo(ctx, repo); err != nil {
 			s.logger.Error("仓库审查失败", "repo", repo.Owner+"/"+repo.Repo, "error", err.Error())
@@ -194,16 +198,20 @@ func (s *Service) RunOnce(ctx context.Context) {
 	// 【分支推送审查】扫描 Codeup 仓库分支 HEAD 变化，增量审查新提交
 	if s.cu != nil {
 		for _, repo := range s.cfg.Codeup.Repos {
-			if err := s.reviewCodeupRepo(ctx, repo); err != nil {
-				s.logger.Error("分支推送审查失败", "repo", repo.DisplayName(), "error", err.Error())
-			}
 			// 【MR 审查】扫描 Codeup 开启状态的合并请求（新版本未审时触发）
 			if s.cfg.Codeup.MRReview {
 				if err := s.reviewCodeupMRs(ctx, repo); err != nil {
 					s.logger.Error("MR 审查失败", "repo", repo.DisplayName(), "error", err.Error())
 				}
 			}
+			if err := s.reviewCodeupRepo(ctx, repo); err != nil {
+				s.logger.Error("分支推送审查失败", "repo", repo.DisplayName(), "error", err.Error())
+			}
 		}
+	}
+	ctx = context.WithValue(ctx, collectionKey{}, false)
+	if err := s.executeCollected(ctx, candidates); err != nil {
+		s.logger.Warn("本轮审核未完成", "error", err)
 	}
 }
 
@@ -248,7 +256,7 @@ func (s *Service) reviewRepo(ctx context.Context, repo config.RepoConfig) error 
 // reviewPR 审查单个 PR。
 func (s *Service) reviewPR(ctx context.Context, repo config.RepoConfig, pr *github.PullRequest) error {
 	key := fmt.Sprintf("github:%s/%s:%d", repo.Owner, repo.Repo, pr.Number)
-	return s.tasks.run(ctx, key, pr.Head.SHA, func() error {
+	return s.runTask(ctx, key, pr.Head.SHA+":"+pr.Base.SHA+":"+fingerprint([]string{pr.Title, pr.Body}), func(ctx context.Context) error {
 		return s.reviewPRSnapshot(ctx, repo, pr)
 	})
 }
@@ -262,7 +270,8 @@ func (s *Service) reviewPRSnapshot(ctx context.Context, repo config.RepoConfig, 
 	if err != nil {
 		return err
 	}
-	marker := notifier.Marker(pr.Head.SHA)
+	inputSignature := fingerprint([]string{s.signature(s.reviewRules(ctx)), pr.Title, pr.Body})
+	marker := notifier.Marker(pr.Head.SHA + ":" + pr.Base.SHA + ":" + inputSignature)
 	for _, c := range comments {
 		if strings.Contains(c.Body, marker) {
 			log.Debug("跳过 PR：该 Commit 已审查")
@@ -271,7 +280,10 @@ func (s *Service) reviewPRSnapshot(ctx context.Context, repo config.RepoConfig, 
 	}
 
 	// 获取并解析 diff
-	rawDiff, err := s.gh.GetPRDiff(ctx, repo.Owner, repo.Repo, pr.Number)
+	if pr.Head.SHA == "" || pr.Base.SHA == "" {
+		return fmt.Errorf("PR 缺少固定的源/目标 SHA")
+	}
+	rawDiff, err := s.gh.GetCompareDiff(ctx, repo.Owner, repo.Repo, pr.Base.SHA, pr.Head.SHA)
 	if err != nil {
 		// 兜底：区分"合并冲突"与其他错误，避免冲突 PR 反复报错
 		if strings.Contains(err.Error(), "合并冲突") {
@@ -285,8 +297,15 @@ func (s *Service) reviewPRSnapshot(ctx context.Context, repo config.RepoConfig, 
 		return err
 	}
 
+	if err := s.checkPRVersion(ctx, repo, pr); err != nil {
+		return err
+	}
+	ctx = s.checkpointContext(ctx, fmt.Sprintf("github:%s:%d:%s:%s:%s", full, pr.Number, pr.Head.SHA, pr.Base.SHA, fingerprint(rawDiff)))
 	summary, err := s.reviewDiff(ctx, rawDiff, full, pr.Title, pr.Body, log)
 	if err != nil || summary == nil {
+		return err
+	}
+	if err := s.checkPRVersion(ctx, repo, pr); err != nil {
 		return err
 	}
 
@@ -297,7 +316,7 @@ func (s *Service) reviewPRSnapshot(ctx context.Context, repo config.RepoConfig, 
 		MaxIssuesDisplay: s.cfg.Notification.MaxIssuesDisplay,
 		Author:           pr.User.Login,
 		Reviewers:        pr.Reviewers(),
-		CommitSHA:        pr.Head.SHA,
+		CommitSHA:        pr.Head.SHA + ":" + pr.Base.SHA + ":" + inputSignature,
 		Timezone:         s.tz,
 	})
 
@@ -307,7 +326,7 @@ func (s *Service) reviewPRSnapshot(ctx context.Context, repo config.RepoConfig, 
 			"issues", len(summary.Issues), "report", body)
 		return nil
 	}
-	if err := s.gh.PostComment(ctx, repo.Owner, repo.Repo, pr.Number, body); err != nil {
+	if err := s.publishOnce(ctx, "github:"+full+":"+fmt.Sprint(pr.Number)+":"+marker, body, func() error { return s.gh.PostComment(ctx, repo.Owner, repo.Repo, pr.Number, body) }); err != nil {
 		return err
 	}
 	log.Info("评论已发布")
@@ -329,6 +348,15 @@ func (s *Service) reviewDiff(ctx context.Context, rawDiff, repoFullName, title, 
 	if len(files) == 0 {
 		log.Info("跳过：筛选后无待审查文件", "total_files", len(allFiles))
 		return nil, nil
+	}
+	if attempt, ok := ctx.Value(pipelineKey{}).(*pipelineAttempt); ok {
+		attempt.started = true
+	}
+	if err := s.llm.Availability(ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		log.Info("模型处于冷却期，先复用已有检查点；缺失结果时等待可用模型", "error", err)
 	}
 	totalFiltered := len(files)
 	if len(files) > s.cfg.Review.MaxFilesPerReview {
@@ -373,9 +401,13 @@ func (s *Service) reviewDiff(ctx context.Context, rawDiff, repoFullName, title, 
 	if s.analyzer != nil {
 		var globalDocument string
 		if s.knowledge != nil {
-			snapshot, usage, prepareErr := s.knowledge.Prepare(ctx, model)
+			snapshot, usage, prepareErr := s.prepareKnowledge(ctx, model)
 			knowledgeUsage = usage
 			if prepareErr != nil {
+				var persistence snapshotPersistenceError
+				if errors.As(prepareErr, &persistence) {
+					return nil, prepareErr
+				}
 				knowledgeStatus = "降级：" + prepareErr.Error()
 				if s.cfg.Understanding.Strict {
 					return nil, prepareErr
@@ -420,7 +452,7 @@ func (s *Service) reviewDiff(ctx context.Context, rawDiff, repoFullName, title, 
 	}
 
 	// 多 Agent 并行审查（按包 × 角色分发）+ 定位 + 反思去重
-	doc := s.rulesStore.Current()
+	doc := s.reviewRules(ctx)
 	summary := s.coord.Run(ctx, base, pkgs, func(role string, pkgFiles []*diff.FileDiff) []string {
 		return doc.ForAgent(role, pkgFiles)
 	}, files, coordinator.Options{
@@ -495,20 +527,20 @@ func analysisDiff(files []*diff.FileDiff, maxChars int) string {
 
 // ReviewLocalDiff 本地 diff 审查（demo 调试入口，不依赖 GitHub）。
 func (s *Service) ReviewLocalDiff(ctx context.Context, rawDiff, title string) (string, error) {
-	ctx, cancel := s.roundContext(ctx)
-	defer cancel()
-	summary, err := s.reviewDiff(ctx, rawDiff, "local/diff", title, "", s.logger)
-	if err != nil {
-		return "", err
-	}
-	if summary == nil {
-		return "", fmt.Errorf("筛选后无待审查文件")
-	}
-	return notifier.BuildComment(*summary, notifier.Options{
-		MaxIssuesDisplay: s.cfg.Notification.MaxIssuesDisplay,
-		CommitSHA:        "local",
-		Timezone:         s.tz,
-	}), nil
+	var report string
+	err := s.runTask(ctx, "local:"+fingerprint(title), "", func(ctx context.Context) error {
+		ctx = s.checkpointContext(ctx, "local:"+fingerprint([]string{title, rawDiff}))
+		summary, err := s.reviewDiff(ctx, rawDiff, "local/diff", title, "", s.logger)
+		if err != nil {
+			return err
+		}
+		if summary == nil {
+			return fmt.Errorf("筛选后无待审查文件")
+		}
+		report = notifier.BuildComment(*summary, notifier.Options{MaxIssuesDisplay: s.cfg.Notification.MaxIssuesDisplay, CommitSHA: "local", Timezone: s.tz})
+		return nil
+	})
+	return report, err
 }
 
 // reviewCodeupRepo 审查单个 Codeup 仓库的分支推送：
@@ -550,7 +582,7 @@ func (s *Service) reviewCodeupRepo(ctx context.Context, repo config.CodeupRepoCo
 func (s *Service) reviewBranchPush(ctx context.Context, repo config.CodeupRepoConfig,
 	br *codeup.Branch, baseBranch string) error {
 	key := "branch:" + repo.RepositoryID + ":" + br.Name
-	return s.tasks.run(ctx, key, br.Commit.ID, func() error {
+	return s.runTask(ctx, key, br.Commit.ID, func(ctx context.Context) error {
 		return s.reviewBranchSnapshot(ctx, repo, br, baseBranch)
 	})
 }
@@ -585,6 +617,7 @@ func (s *Service) reviewBranchSnapshot(ctx context.Context, repo config.CodeupRe
 	}
 
 	title := fmt.Sprintf("分支 %s 新推送（%d 个提交）: %s", br.Name, len(commits), br.Commit.Title)
+	ctx = s.checkpointContext(ctx, fmt.Sprintf("branch:%s:%s:%s:%s", repo.RepositoryID, br.Name, from, head))
 	summary, err := s.reviewDiff(ctx, rawDiff, name, title, "", log)
 	if err != nil {
 		return err
@@ -609,7 +642,7 @@ func (s *Service) reviewBranchSnapshot(ctx context.Context, repo config.CodeupRe
 			"issues", len(summary.Issues), "report", body)
 		return s.branchSt.Set(key, head)
 	}
-	if err := s.cu.CreateCommitComment(ctx, repo.RepositoryID, head, body); err != nil {
+	if err := s.publishOnce(ctx, "branch:"+repo.RepositoryID+":"+head+":"+s.signature(s.reviewRules(ctx)), body, func() error { return s.cu.CreateCommitComment(ctx, repo.RepositoryID, head, body) }); err != nil {
 		return err
 	}
 	log.Info("commit 评论已发布", "issues", len(summary.Issues))
@@ -641,8 +674,6 @@ func (s *Service) ReviewCodeupMR(ctx context.Context, repositoryID string, local
 	if selected == nil {
 		return fmt.Errorf("Codeup 仓库未配置: %s", repositoryID)
 	}
-	ctx, cancel := s.roundContext(ctx)
-	defer cancel()
 	if !s.cfg.Review.InActiveHours(time.Now()) {
 		return fmt.Errorf("当前不在审查时间窗口内")
 	}
@@ -715,9 +746,25 @@ func (s *Service) reviewCodeupMRs(ctx context.Context, repo config.CodeupRepoCon
 func (s *Service) reviewChangeRequest(ctx context.Context, repo config.CodeupRepoConfig,
 	mr *codeup.ChangeRequest) error {
 	key := fmt.Sprintf("mr:%s:%d", repo.RepositoryID, mr.LocalID)
+	version := ""
+	if _, collecting := ctx.Value(collectionKey{}).(*[]reviewCandidate); collecting {
+		versions, err := s.cu.ListPatchSets(ctx, repo.RepositoryID, mr.LocalID)
+		if err != nil {
+			return err
+		}
+		source := codeup.SourcePatchSet(versions)
+		if source == nil {
+			return nil
+		}
+		target, err := s.mrTargetSHA(ctx, repo.RepositoryID, mr.TargetBranch, versions)
+		if err != nil {
+			return err
+		}
+		version = source.CommitID + ":" + target + ":" + fingerprint([]string{mr.Title, mr.Description})
+	}
 	// Claim the MR before fetching patch sets. Completed versions are deduplicated
 	// by the persistent baseline inside reviewChangeRequestSnapshot.
-	return s.tasks.run(ctx, key, "", func() error {
+	return s.runTask(ctx, key, version, func(ctx context.Context) error {
 		return s.reviewChangeRequestSnapshot(ctx, repo, mr)
 	})
 }
@@ -747,14 +794,15 @@ func (s *Service) reviewChangeRequestSnapshot(ctx context.Context, repo config.C
 		return fmt.Errorf("MR 源版本缺少提交 SHA 或版本 ID")
 	}
 	key := "mr:" + repo.RepositoryID + ":" + fmt.Sprint(mr.LocalID)
-	if s.branchSt.Get(key) == src.CommitID {
-		return nil
-	}
 	log = log.With("sha", short(src.CommitID))
 
 	targetSHA, err := s.mrTargetSHA(ctx, repo.RepositoryID, mr.TargetBranch, ps)
 	if err != nil {
 		return err
+	}
+	inputSignature := fingerprint([]string{s.signature(s.reviewRules(ctx)), mr.Title, mr.Description})
+	if s.branchSt.MatchesReview(key, src.CommitID, targetSHA, inputSignature) {
+		return nil
 	}
 	if src.CommitID == "" || src.PatchSetBizID == "" {
 		return fmt.Errorf("MR 源版本缺少提交 SHA 或版本 ID")
@@ -765,10 +813,8 @@ func (s *Service) reviewChangeRequestSnapshot(ctx context.Context, repo config.C
 	}
 
 	title := fmt.Sprintf("MR !%d %s（%s -> %s）", mr.LocalID, mr.Title, mr.SourceBranch, mr.TargetBranch)
-	if s.cfg.Review.CheckpointDir != "" {
-		scope := fmt.Sprintf("%s!%d:%s:%s", repo.RepositoryID, mr.LocalID, src.CommitID, targetSHA)
-		ctx = llm.WithCheckpoint(ctx, s.cfg.Review.CheckpointDir, scope)
-	}
+	scope := fmt.Sprintf("%s!%d:%s:%s", repo.RepositoryID, mr.LocalID, src.CommitID, targetSHA)
+	ctx = s.checkpointContext(ctx, scope)
 	summary, err := s.reviewDiff(ctx, rawDiff, name, title, mr.Description, log)
 	if err != nil {
 		return err
@@ -789,8 +835,22 @@ func (s *Service) reviewChangeRequestSnapshot(ctx context.Context, repo config.C
 	if current == nil || current.CommitID != src.CommitID || current.PatchSetBizID != src.PatchSetBizID || freshTarget != targetSHA {
 		return fmt.Errorf("MR 版本在审查期间发生变化，放弃发布及基线推进")
 	}
+	open, err := s.cu.ListOpenChangeRequests(ctx, repo.RepositoryID)
+	if err != nil {
+		return err
+	}
+	stillCurrent := false
+	for _, item := range open {
+		if item.LocalID == mr.LocalID && item.State != "CLOSED" && item.State != "MERGED" && item.Title == mr.Title && item.Description == mr.Description && item.SourceBranch == mr.SourceBranch && item.TargetBranch == mr.TargetBranch && !item.IsWIP() && !item.HasConflict() {
+			stillCurrent = true
+			break
+		}
+	}
+	if !stillCurrent {
+		return fmt.Errorf("MR 已关闭或元数据发生变化，放弃发布及基线推进")
+	}
 	if summary == nil {
-		return s.branchSt.Set(key, src.CommitID)
+		return s.branchSt.SetReview(key, src.CommitID, targetSHA, inputSignature)
 	}
 
 	body := notifier.BuildComment(*summary, notifier.Options{
@@ -805,14 +865,16 @@ func (s *Service) reviewChangeRequestSnapshot(ctx context.Context, repo config.C
 	if !s.cfg.Codeup.MRComment || s.cfg.Review.DryRun {
 		log.Info("MR 评论发布已禁用（模拟审查），审查报告如下",
 			"issues", len(summary.Issues), "report", body)
-		return s.branchSt.Set(key, src.CommitID)
+		return s.branchSt.SetReview(key, src.CommitID, targetSHA, inputSignature)
 	}
-	if err := s.cu.CreateChangeRequestComment(ctx, repo.RepositoryID, mr.LocalID,
-		src.PatchSetBizID, body); err != nil {
+	publicationID := fmt.Sprintf("mr:%s:%d:%s:%s:%s", repo.RepositoryID, mr.LocalID, src.CommitID, targetSHA, inputSignature)
+	if err := s.publishOnce(ctx, publicationID, body, func() error {
+		return s.cu.CreateChangeRequestComment(ctx, repo.RepositoryID, mr.LocalID, src.PatchSetBizID, body)
+	}); err != nil {
 		return err
 	}
 	log.Info("MR 评论已发布", "issues", len(summary.Issues))
-	return s.branchSt.Set(key, src.CommitID)
+	return s.branchSt.SetReview(key, src.CommitID, targetSHA, inputSignature)
 }
 
 func (s *Service) mrTargetSHA(ctx context.Context, repository, targetBranch string, versions []*codeup.PatchSet) (string, error) {

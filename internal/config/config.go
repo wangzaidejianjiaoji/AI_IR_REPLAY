@@ -126,10 +126,10 @@ type LLMConfig struct {
 
 // FallbackConfig 备用模型配置。
 type FallbackConfig struct {
-	Enabled bool              `yaml:"enabled"` // 是否启用备用模型
-	APIKey  string            `yaml:"api_key"` // 备用模型 API Key
+	Enabled bool              `yaml:"enabled"`  // 是否启用备用模型
+	APIKey  string            `yaml:"api_key"`  // 备用模型 API Key
 	BaseURL string            `yaml:"base_url"` // 备用模型 Base URL
-	Models  map[string]string `yaml:"models"`  // 备用模型分级配置
+	Models  map[string]string `yaml:"models"`   // 备用模型分级配置
 }
 
 type ModelPrice struct {
@@ -179,6 +179,7 @@ type Agent struct {
 
 // ReviewConfig 审查行为配置。
 type ReviewConfig struct {
+	RuntimeDir          string   `yaml:"runtime_dir"`
 	CheckpointDir       string   `yaml:"checkpoint_dir"`
 	DryRun              bool     `yaml:"dry_run"`
 	MaxDiffChars        int      `yaml:"max_diff_chars"`
@@ -311,19 +312,26 @@ func Load(path string) (*Config, error) {
 	if err := decoder.Decode(cfg); err != nil {
 		return nil, fmt.Errorf("parse config %s: %w", path, err)
 	}
-	if err:=decoder.Decode(new(any));err!=io.EOF{return nil,fmt.Errorf("配置只允许一个 YAML 文档")}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return nil, fmt.Errorf("配置只允许一个 YAML 文档")
+	}
 
 	cfg.applyEnvOverrides()
 	if err := cfg.ValidateRuntime(); err != nil {
 		return nil, err
 	}
 	cfg.applyDefaults()
-	if err:=cfg.ValidateRuntime();err!=nil{return nil,err}
+	if err := cfg.ValidateRuntime(); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }
 
 // applyEnvOverrides 应用环境变量覆盖（优先级高于配置文件）。
 func (c *Config) applyEnvOverrides() {
+	if v := os.Getenv("AGENT_REVIEW_RUNTIME_DIR"); v != "" {
+		c.Review.RuntimeDir = v
+	}
 	if v := os.Getenv("AGENT_LOG_LEVEL"); v != "" {
 		c.Logging.Level = v
 	}
@@ -340,6 +348,12 @@ func (c *Config) applyEnvOverrides() {
 
 // applyDefaults 填充缺省值。
 func (c *Config) applyDefaults() {
+	if c.Review.RuntimeDir == "" {
+		c.Review.RuntimeDir = "./data/review-runtime"
+	}
+	if c.Review.CheckpointDir == "" {
+		c.Review.CheckpointDir = "./data/checkpoints"
+	}
 	if c.GitHub.APIBase == "" {
 		c.GitHub.APIBase = "https://api.github.com"
 	}
@@ -455,9 +469,15 @@ func (c *Config) ValidateRuntime() error {
 		}
 	}
 	if c.Review.MaxRoundCost > 0 {
-		for _, name := range c.LLM.Models {
-			if _, ok := c.LLM.Prices[name]; !ok {
-				return fmt.Errorf("费用预算需要配置模型 %s 的 llm.prices", name)
+		models := []map[string]string{c.LLM.Models}
+		if c.LLM.Fallback != nil && c.LLM.Fallback.Enabled {
+			models = append(models, c.LLM.Fallback.Models)
+		}
+		for _, group := range models {
+			for _, name := range group {
+				if _, ok := c.LLM.Prices[name]; !ok {
+					return fmt.Errorf("费用预算需要配置模型 %s 的 llm.prices", name)
+				}
 			}
 		}
 	}
@@ -482,7 +502,7 @@ func (c *Config) ValidateRuntime() error {
 			return fmt.Errorf("%s 不能为负数", name)
 		}
 	}
-	known := map[string]bool{"architect": true, "security": true, "performance": true, "standard": true, "test": true, "ai": true, "ui": true, "ai_tool": true,"concurrency":true,"resource":true,"dataflow":true}
+	known := map[string]bool{"architect": true, "security": true, "performance": true, "standard": true, "test": true, "ai": true, "ui": true, "ai_tool": true, "concurrency": true, "resource": true, "dataflow": true}
 	for role, a := range c.Agents {
 		if !known[role] {
 			return fmt.Errorf("不支持 Agent 角色 %q", role)

@@ -23,12 +23,12 @@ type Client struct {
 
 // PullRequest PR 元信息（仅保留审查所需字段）。
 type PullRequest struct {
-	Number         int     `json:"number"`
-	Title          string  `json:"title"`
-	Body           string  `json:"body"`
-	State          string  `json:"state"`
-	Mergeable      *bool   `json:"mergeable"`       // nil=计算中, true=可合并, false=有冲突
-	MergeableState string  `json:"mergeable_state"` // clean=无冲突, dirty=有冲突, unknown=计算中
+	Number         int    `json:"number"`
+	Title          string `json:"title"`
+	Body           string `json:"body"`
+	State          string `json:"state"`
+	Mergeable      *bool  `json:"mergeable"`       // nil=计算中, true=可合并, false=有冲突
+	MergeableState string `json:"mergeable_state"` // clean=无冲突, dirty=有冲突, unknown=计算中
 	User           struct {
 		Login string `json:"login"`
 	} `json:"user"`
@@ -37,6 +37,7 @@ type PullRequest struct {
 		Ref string `json:"ref"`
 	} `json:"head"`
 	Base struct {
+		SHA string `json:"sha"`
 		Ref string `json:"ref"`
 	} `json:"base"`
 	Assignees []struct {
@@ -118,6 +119,39 @@ func (c *Client) ListOpenPRs(ctx context.Context, owner, repo string) ([]*PullRe
 }
 
 // GetPRDiff 获取 PR 的 unified diff 文本（Accept: diff 媒体类型）。
+func (c *Client) GetPR(ctx context.Context, owner, repo string, number int) (*PullRequest, error) {
+	var pr PullRequest
+	err := c.getJSON(ctx, fmt.Sprintf("%s/repos/%s/%s/pulls/%d", c.apiBase, owner, repo, number), &pr)
+	return &pr, err
+}
+
+// GetCompareDiff uses immutable commits rather than the moving PR diff URL.
+func (c *Client) GetCompareDiff(ctx context.Context, owner, repo, base, head string) (string, error) {
+	url := fmt.Sprintf("%s/repos/%s/%s/compare/%s...%s", c.apiBase, owner, repo, base, head)
+	req, err := c.newRequest(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/vnd.github.v3.diff")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	const limit = 20 * 1024 * 1024
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return "", err
+	}
+	if len(raw) > limit {
+		return "", fmt.Errorf("GitHub diff exceeds %d byte transport limit; refusing partial review", limit)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("GitHub compare status %d", resp.StatusCode)
+	}
+	return string(raw), nil
+}
+
 func (c *Client) GetPRDiff(ctx context.Context, owner, repo string, number int) (string, error) {
 	url := fmt.Sprintf("%s/repos/%s/%s/pulls/%d", c.apiBase, owner, repo, number)
 	req, err := c.newRequest(ctx, http.MethodGet, url, nil)

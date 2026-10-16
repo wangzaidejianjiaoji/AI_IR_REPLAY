@@ -14,6 +14,8 @@ import (
 
 // Entry 单个分支的审查基线。
 type Entry struct {
+	TargetSHA  string    `json:"target_sha,omitempty"`
+	InputHash  string    `json:"input_hash,omitempty"`
 	SHA        string    `json:"sha"`         // 最后已审查的 Commit SHA
 	ReviewedAt time.Time `json:"reviewed_at"` // 基线更新时间
 }
@@ -50,10 +52,34 @@ func (s *Store) Get(key string) string {
 
 // Set 更新基线并立即落盘。
 func (s *Store) Set(key, sha string) error {
+	return s.SetVersion(key, sha, "")
+}
+
+func (s *Store) GetVersion(key string) (string, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e := s.data[key]
+	return e.SHA, e.TargetSHA
+}
+
+// SetVersion atomically persists both sides. Legacy entries have no target
+// and must be reviewed once again before matching the new snapshot identity.
+func (s *Store) SetVersion(key, sha, target string) error {
+	return s.SetReview(key, sha, target, "")
+}
+
+func (s *Store) MatchesReview(key, sha, target, input string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e := s.data[key]
+	return e.SHA == sha && e.TargetSHA == target && e.InputHash == input
+}
+
+func (s *Store) SetReview(key, sha, target, input string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	previous, existed := s.data[key]
-	s.data[key] = Entry{SHA: sha, ReviewedAt: time.Now()}
+	s.data[key] = Entry{SHA: sha, TargetSHA: target, InputHash: input, ReviewedAt: time.Now()}
 	if err := s.save(); err != nil {
 		if existed {
 			s.data[key] = previous

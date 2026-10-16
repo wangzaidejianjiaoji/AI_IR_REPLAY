@@ -25,6 +25,22 @@ func classifyQuota(resp *http.Response, body []byte, now time.Time) *QuotaError 
 	if resp == nil || (resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode != http.StatusForbidden) {
 		return nil
 	}
+	// Authentication/configuration failures can mention a quota endpoint. The
+	// provider's structured error code takes precedence over message keywords.
+	var envelope struct {
+		Error struct {
+			Type string `json:"type"`
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &envelope) == nil {
+		for _, code := range []string{envelope.Error.Type, envelope.Error.Code} {
+			switch strings.ToLower(code) {
+			case "authentication_error", "invalid_api_key", "permission_denied", "invalid_request_error", "model_not_found":
+				return nil
+			}
+		}
+	}
 	period, delay := "rate_limit", time.Minute
 	if resp.StatusCode == http.StatusForbidden {
 		evidence := strings.ToLower(string(body))

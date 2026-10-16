@@ -8,9 +8,9 @@ import (
 	"gvs-pr-agent/internal/agent"
 	"gvs-pr-agent/internal/diff"
 	"gvs-pr-agent/internal/llm"
+	"gvs-pr-agent/internal/packager"
 	"gvs-pr-agent/internal/textbudget"
 	"io"
-	"sort"
 	"strings"
 )
 
@@ -20,8 +20,16 @@ const maxConfirmationBytes = 160000
 
 const confirmationSystem = `你是最终代码审查统筹确认 Agent。逐项核对候选、其源码证据、变更意图和实际逻辑。禁止新增或改写问题、位置和建议。只为输入 candidate_id 返回 confirmed=true/false 和 reason（确认、驳回或重复原因）。所有输入 ID 各返回一次；只输出 JSON：{"overview":"简述","decisions":[{"candidate_id":"输入ID","confirmed":true,"reason":"证据理由"}]}`
 
-func confirmationUser(changeContext string, encoded []byte) string {
-	return "## 全局理解与变更意图\n" + changeContext + "\n\n每个候选的 evidence 是当前版本的完整文件 diff；逐项核对，不得省略任何输入 ID。\n\n## 待确认候选问题\n" + string(encoded)
+func confirmationUser(changeContext string, input []confirmationCandidate) string {
+	evidence := map[string]string{}
+	for _, candidate := range input {
+		for id, patch := range candidate.parts {
+			evidence[id] = patch
+		}
+	}
+	encodedEvidence, _ := json.Marshal(evidence)
+	encoded, _ := json.Marshal(input)
+	return "## 全局理解与变更意图\n" + changeContext + "\n\n每个候选的 evidence_ids 引用下方共享证据；每项证据保留原始文件头和完整 hunk，可能仅覆盖候选所在 hunk，不代表整个文件。逐项核对，不得省略任何输入 ID。\n\n## 共享源码证据\n" + string(encodedEvidence) + "\n\n## 待确认候选问题\n" + string(encoded)
 }
 
 type confirmChatClient interface {
@@ -46,9 +54,11 @@ type ConfirmationResult struct {
 	DiffReviewedBytes int
 }
 type confirmationCandidate struct {
-	ID       string      `json:"candidate_id"`
-	Issue    agent.Issue `json:"issue"`
-	Evidence string      `json:"evidence"`
+	ID          string      `json:"candidate_id"`
+	Issue       agent.Issue `json:"issue"`
+	Evidence    string      `json:"evidence"`
+	EvidenceIDs []string    `json:"evidence_ids"`
+	parts       map[string]string
 }
 
 func (c *Confirmer) Confirm(ctx context.Context, in ConfirmationInput) (ConfirmationResult, llm.Usage, error) {
@@ -62,12 +72,10 @@ func (c *Confirmer) Confirm(ctx context.Context, in ConfirmationInput) (Confirma
 		files[f.Path] = f
 	}
 	candidates := append([]agent.Issue(nil), in.Candidates...)
-	sort.SliceStable(candidates, func(i, j int) bool {
-		return agent.SeverityRank(candidates[i].Severity) > agent.SeverityRank(candidates[j].Severity)
-	})
+	sortIssues(candidates)
 	seen := map[string]bool{}
-	reviewedFiles := map[string]bool{}
-	expectedFiles := map[string]bool{}
+	reviewedEvidence := map[string]bool{}
+	expectedEvidence := map[string]bool{}
 	var batch []agent.Issue
 	var evidence []confirmationCandidate
 	var overviews []string
@@ -86,10 +94,12 @@ func (c *Confirmer) Confirm(ctx context.Context, in ConfirmationInput) (Confirma
 		result.Issues = append(result.Issues, got.Issues...)
 		result.RejectedCount += got.RejectedCount
 		overviews = append(overviews, got.Overview)
-		for _, issue := range batch {
-			if !reviewedFiles[issue.File] {
-				result.DiffReviewedBytes += len(files[issue.File].Patch)
-				reviewedFiles[issue.File] = true
+		for _, candidate := range evidence {
+			for id, patch := range candidate.parts {
+				if !reviewedEvidence[id] {
+					result.DiffReviewedBytes += len(patch)
+					reviewedEvidence[id] = true
+				}
 			}
 		}
 		batch = nil
@@ -107,20 +117,33 @@ func (c *Confirmer) Confirm(ctx context.Context, in ConfirmationInput) (Confirma
 			continue
 		}
 		seen[id] = true
-		if !expectedFiles[issue.File] {
-			result.DiffTotalBytes += len(f.Patch)
-			expectedFiles[issue.File] = true
+		parts := []*diff.FileDiff{f}
+		encodedPatch, _ := json.Marshal(f.Patch)
+		if len(encodedPatch) > 120000 {
+			parts = nil
+			for _, part := range packager.CompleteHunks(f) {
+				if issue.Line == 0 || part.ContainsLine(issue.Line) {
+					parts = append(parts, part)
+				}
+			}
 		}
-		candidate := confirmationCandidate{ID: id, Issue: issue, Evidence: f.Patch}
+		candidate := confirmationCandidate{ID: id, Issue: issue, parts: map[string]string{}}
+		for _, part := range parts {
+			evidenceID := fmt.Sprintf("%x", sha256.Sum256([]byte(part.Path+"\x00"+part.Patch)))
+			candidate.EvidenceIDs = append(candidate.EvidenceIDs, evidenceID)
+			candidate.parts[evidenceID] = part.Patch
+			if !expectedEvidence[evidenceID] {
+				result.DiffTotalBytes += len(part.Patch)
+				expectedEvidence[evidenceID] = true
+			}
+		}
 		next := append(append([]confirmationCandidate(nil), evidence...), candidate)
-		encoded, _ := json.Marshal(next)
-		if len(batch) >= maxConfirmCandidates || len(confirmationUser(in.ChangeContext, encoded))+len(confirmationSystem) > maxConfirmationBytes {
+		if len(batch) >= maxConfirmCandidates || len(confirmationUser(in.ChangeContext, next))+len(confirmationSystem) > maxConfirmationBytes {
 			if err := flush(); err != nil {
 				return result, usage, err
 			}
 		}
-		encoded, _ = json.Marshal(append(evidence, candidate))
-		if len(confirmationUser(in.ChangeContext, encoded))+len(confirmationSystem) > maxConfirmationBytes {
+		if len(confirmationUser(in.ChangeContext, append(evidence, candidate)))+len(confirmationSystem) > maxConfirmationBytes {
 			return result, usage, fmt.Errorf("统筹确认完整候选证据超出批次文本预算：%s；拒绝截断", issue.File)
 		}
 		batch = append(batch, issue)
@@ -129,21 +152,12 @@ func (c *Confirmer) Confirm(ctx context.Context, in ConfirmationInput) (Confirma
 	if err := flush(); err != nil {
 		return result, usage, err
 	}
-	// Confirmation coverage is the evidence for candidate files, not unrelated diff.
+	// Coverage counts unique evidence actually supplied, not unrelated file hunks.
 	result.Overview = fmt.Sprintf("分批确认 %d，驳回 %d，未确认 %d。%s", len(result.Issues), result.RejectedCount, result.UnconfirmedCount, strings.Join(overviews, "；"))
 	if len(candidates) == 0 {
 		result.Overview = "无候选问题，不调用确认模型"
 	}
-	sort.SliceStable(result.Issues, func(i, j int) bool {
-		a, b := result.Issues[i], result.Issues[j]
-		if a.Severity != b.Severity {
-			return agent.SeverityRank(a.Severity) > agent.SeverityRank(b.Severity)
-		}
-		if a.File != b.File {
-			return a.File < b.File
-		}
-		return a.Line < b.Line
-	})
+	sortIssues(result.Issues)
 	return result, usage, nil
 }
 
@@ -153,8 +167,7 @@ func (c *Confirmer) confirmBatch(ctx context.Context, in ConfirmationInput, inpu
 	for _, candidate := range input {
 		allowed[candidate.ID] = candidate.Issue
 	}
-	encoded, _ := json.Marshal(input)
-	messages := []llm.Message{{Role: "system", Content: confirmationSystem}, {Role: "user", Content: confirmationUser(in.ChangeContext, encoded)}}
+	messages := []llm.Message{{Role: "system", Content: confirmationSystem}, {Role: "user", Content: confirmationUser(in.ChangeContext, input)}}
 	content, usage, err := c.client.Chat(ctx, in.Model, messages)
 	if err != nil {
 		return result, usage, fmt.Errorf("统筹确认 Agent: %w", err)
@@ -218,16 +231,7 @@ func (c *Confirmer) confirmBatch(ctx context.Context, in ConfirmationInput, inpu
 		return result, usage, fmt.Errorf("统筹确认遗漏 %d 个候选，拒绝发布不完整结论", result.UnconfirmedCount)
 	}
 	result.Overview = fmt.Sprintf("确认 %d，驳回 %d，未确认 %d（候选或文本预算/遗漏）。%s", len(result.Issues), result.RejectedCount, result.UnconfirmedCount, raw.Overview)
-	sort.SliceStable(result.Issues, func(i, j int) bool {
-		a, b := result.Issues[i], result.Issues[j]
-		if agent.SeverityRank(a.Severity) != agent.SeverityRank(b.Severity) {
-			return agent.SeverityRank(a.Severity) > agent.SeverityRank(b.Severity)
-		}
-		if a.File != b.File {
-			return a.File < b.File
-		}
-		return a.Line < b.Line
-	})
+	sortIssues(result.Issues)
 	validated = true
 	return result, usage, nil
 }

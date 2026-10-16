@@ -13,8 +13,11 @@ import (
 	"gvs-pr-agent/internal/textbudget"
 )
 
-// PackBounded retains complete file patches; it never truncates review evidence.
+// PackBounded retains complete hunks; it never truncates review evidence.
 func PackBounded(files []*diff.FileDiff, maxFiles, maxBytes int) ([]Package, error) {
+	if maxFiles <= 0 {
+		maxFiles = 5
+	}
 	var out []Package
 	for _, pkg := range Pack(files, maxFiles) {
 		part := Package{Name: pkg.Name}
@@ -27,15 +30,18 @@ func PackBounded(files []*diff.FileDiff, maxFiles, maxBytes int) ([]Package, err
 				bytes = 0
 			}
 		}
-		for _, file := range pkg.Files {
-			if maxBytes > 0 && len(file.Patch) > maxBytes {
-				return nil, fmt.Errorf("审查覆盖不完整：文件 %s 的 diff 为 %d 字节，超过 max_diff_chars=%d；拒绝截断审核", file.Path, len(file.Patch), maxBytes)
+		for _, original := range pkg.Files {
+			parts, err := splitBounded(original, maxBytes)
+			if err != nil {
+				return nil, err
 			}
-			if maxBytes > 0 && bytes+len(file.Patch) > maxBytes {
-				flush()
+			for _, file := range parts {
+				if len(part.Files) >= maxFiles || (maxBytes > 0 && bytes+len(file.Patch) > maxBytes) {
+					flush()
+				}
+				part.Files = append(part.Files, file)
+				bytes += len(file.Patch)
 			}
-			part.Files = append(part.Files, file)
-			bytes += len(file.Patch)
 		}
 		flush()
 	}
@@ -108,10 +114,16 @@ func Pack(files []*diff.FileDiff, maxPackageSize int) []Package {
 	}
 
 	var out []Package
+	sort.Strings(order)
 	for _, name := range order {
 		group := grouped[name]
 		// 包内按路径排序，保证输出稳定
-		sort.Slice(group, func(i, j int) bool { return group[i].Path < group[j].Path })
+		sort.Slice(group, func(i, j int) bool {
+			if group[i].Path != group[j].Path {
+				return group[i].Path < group[j].Path
+			}
+			return group[i].Patch < group[j].Patch
+		})
 		// 超过 maxPackageSize 拆分子包
 		for i := 0; i < len(group); i += maxPackageSize {
 			end := i + maxPackageSize

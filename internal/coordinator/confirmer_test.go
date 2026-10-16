@@ -9,6 +9,7 @@ import (
 
 	"gvs-pr-agent/internal/agent"
 	"gvs-pr-agent/internal/llm"
+	"gvs-pr-agent/internal/reflector"
 )
 
 type confirmModel struct {
@@ -47,7 +48,7 @@ func TestConfirmationBatchesByEncodedEvidenceBytes(t *testing.T) {
 		candidates = append(candidates, agent.Issue{File: "a.go", Line: 1, Problem: fmt.Sprintf("p%d", i)})
 	}
 	got, _, err := NewConfirmer(model).Confirm(context.Background(), ConfirmationInput{Diff: patch, Candidates: candidates})
-	if err != nil || len(got.Issues) != 5 || model.calls != 3 || model.maxRequestBytes > maxConfirmationBytes {
+	if err != nil || len(got.Issues) != 5 || model.calls != 1 || model.maxRequestBytes > maxConfirmationBytes {
 		t.Fatalf("issues=%d calls=%d bytes=%d error=%v", len(got.Issues), model.calls, model.maxRequestBytes, err)
 	}
 }
@@ -112,5 +113,75 @@ func TestConfirmerReturnsOnlyConfirmedIssuesSortedByRisk(t *testing.T) {
 	}
 	if got.Issues[0].Severity != "critical" || got.Issues[0].AgentName != "统筹确认 Agent" {
 		t.Fatalf("issues not sorted/attributed: %+v", got.Issues)
+	}
+}
+
+func TestConfirmationSelectsCompleteHunkFromHugeFile(t *testing.T) {
+	header := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n"
+	patch := header + "@@ -1 +1 @@\n-old\n+" + strings.Repeat("x", 180000) + "\n@@ -99 +99 @@\n-before\n+after\n"
+	model := &confirmModel{}
+	got, _, err := NewConfirmer(model).Confirm(context.Background(), ConfirmationInput{Diff: patch, Candidates: []agent.Issue{{File: "a.go", Line: 99, Problem: "tail"}}})
+	if err != nil || len(got.Issues) != 1 || got.DiffReviewedBytes >= len(patch) || got.DiffReviewedBytes != got.DiffTotalBytes {
+		t.Fatalf("result=%+v err=%v", got, err)
+	}
+}
+
+func TestAggregateUsesCompleteIssueTieBreakBeforeReflection(t *testing.T) {
+	c := &Coordinator{refl: reflector.New(false, nil)}
+	a := agent.Issue{File: "a.go", Line: 1, Problem: "same", Detail: "z"}
+	b := a
+	b.Detail = "a"
+	left := c.aggregate([]agent.Result{{Name: "z", Issues: []agent.Issue{a}}, {Name: "a", Issues: []agent.Issue{b}}}, nil, nil)
+	right := c.aggregate([]agent.Result{{Name: "a", Issues: []agent.Issue{b}}, {Name: "z", Issues: []agent.Issue{a}}}, nil, nil)
+	if len(left.Issues) != 1 || len(right.Issues) != 1 || left.Issues[0].Detail != "a" || left.Issues[0].Detail != right.Issues[0].Detail || left.AgentNames[0] != right.AgentNames[0] {
+		t.Fatal("aggregation depends on completion order")
+	}
+}
+
+type recordingConfirmModel struct {
+	confirmModel
+	requests []string
+}
+
+func (m *recordingConfirmModel) Chat(ctx context.Context, model string, messages []llm.Message) (string, llm.Usage, error) {
+	m.requests = append(m.requests, messages[1].Content)
+	return m.confirmModel.Chat(ctx, model, messages)
+}
+func TestConfirmationSharedEvidenceProtocolAndStablePrompt(t *testing.T) {
+	patch := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1 @@\n-old\n+UNIQUE_SOURCE_SENTINEL\n"
+	a := agent.Issue{File: "a.go", Line: 1, Problem: "same", Detail: "z"}
+	b := a
+	b.Detail = "a"
+	first, second := &recordingConfirmModel{}, &recordingConfirmModel{}
+	got, _, err := NewConfirmer(first).Confirm(context.Background(), ConfirmationInput{Diff: patch, Candidates: []agent.Issue{a, b}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = NewConfirmer(second).Confirm(context.Background(), ConfirmationInput{Diff: patch, Candidates: []agent.Issue{b, a}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.requests[0] != second.requests[0] {
+		t.Fatal("prompt changes with candidate arrival order")
+	}
+	if strings.Count(first.requests[0], "UNIQUE_SOURCE_SENTINEL") != 1 || got.DiffTotalBytes != len(patch) || got.DiffReviewedBytes != len(patch) {
+		t.Fatalf("duplicate evidence: %+v", got)
+	}
+	marker := "## 待确认候选问题\n"
+	var candidates []confirmationCandidate
+	if err := json.Unmarshal([]byte(strings.Split(first.requests[0], marker)[1]), &candidates); err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 2 || len(candidates[0].EvidenceIDs) != 1 || candidates[0].EvidenceIDs[0] != candidates[1].EvidenceIDs[0] {
+		t.Fatal("candidate evidence references lost")
+	}
+}
+
+func TestConfirmationSelectsHunkWhenEscapedWholeFileExceedsBudget(t *testing.T) {
+	header := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n"
+	patch := header + "@@ -1 +1 @@\n-old\n+" + strings.Repeat("\\", 85000) + "\n@@ -99 +99 @@\n-before\n+after\n"
+	got, _, err := NewConfirmer(&confirmModel{}).Confirm(context.Background(), ConfirmationInput{Diff: patch, Candidates: []agent.Issue{{File: "a.go", Line: 99, Problem: "tail"}}})
+	if err != nil || len(got.Issues) != 1 {
+		t.Fatalf("encoded full-file size blocked complete relevant hunk: %v", err)
 	}
 }

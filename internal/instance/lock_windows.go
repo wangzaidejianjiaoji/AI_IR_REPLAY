@@ -3,10 +3,13 @@
 package instance
 
 import (
+	"errors"
 	"os"
 	"syscall"
 	"unsafe"
 )
+
+func IsBusy(err error) bool { return errors.Is(err, syscall.Errno(33)) }
 
 var lockFileEx = syscall.NewLazyDLL("kernel32.dll").NewProc("LockFileEx")
 

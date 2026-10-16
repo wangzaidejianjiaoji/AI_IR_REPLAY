@@ -64,12 +64,21 @@ func (m *Manager) Prepare(ctx context.Context, modelName string) (Snapshot, llm.
 	if err != nil {
 		return Snapshot{}, llm.Usage{}, fmt.Errorf("读取本地全局代码理解文档: %w", err)
 	}
-	for _, marker := range sourceRepositoryRe.FindAllStringSubmatch(doc, -1) {
+	repositoryMarkers := sourceRepositoryRe.FindAllStringSubmatch(doc, -1)
+	for _, marker := range repositoryMarkers {
 		if strings.TrimSpace(marker[1]) != m.cfg.SourceRepository {
 			return Snapshot{}, llm.Usage{}, fmt.Errorf("理解文档来源仓库不匹配：配置 %s，文档 %s", m.cfg.SourceRepository, strings.TrimSpace(marker[1]))
 		}
 	}
 	previous := sourceSHA(doc)
+	if previous != "" && len(repositoryMarkers) == 0 {
+		return Snapshot{}, llm.Usage{}, fmt.Errorf("版本化理解文档缺少 SOURCE-REPOSITORY 来源标记")
+	}
+	for _, marker := range sourceSHARe.FindAllStringSubmatch(doc, -1) {
+		if marker[1] != previous {
+			return Snapshot{}, llm.Usage{}, fmt.Errorf("理解文档包含冲突的 SOURCE-SHA 标记")
+		}
+	}
 	fallback := Snapshot{Document: doc, SourceSHA: previous}
 	if previous == "" {
 		fallback = Snapshot{}

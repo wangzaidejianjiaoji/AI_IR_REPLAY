@@ -61,3 +61,51 @@ func TestNewSpecialistCoverage(t *testing.T) {
 		t.Fatalf("unexpected generic module roles: %v", got)
 	}
 }
+
+func TestPackBoundedSplitsOnlyCompleteHunks(t *testing.T) {
+	header := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n"
+	first := "@@ -1 +1 @@\n-old\n+" + strings.Repeat("a", 50) + "\n"
+	last := "@@ -90 +90 @@\n-before\n+" + strings.Repeat("b", 50) + "\n"
+	file := diff.Parse(header + first + last)[0]
+	got, err := PackBounded([]*diff.FileDiff{file}, 5, len(header)+len(last))
+	if err != nil || len(got) != 2 {
+		t.Fatalf("packages=%d err=%v", len(got), err)
+	}
+	for i, want := range []string{header + first, header + last} {
+		f := got[i].Files[0]
+		if f.Patch != want || f.Path != file.Path || len(f.Hunks) != 1 || f.Added != 1 || f.Deleted != 1 {
+			t.Fatalf("incomplete split: %+v", f)
+		}
+	}
+	if got[1].Files[0].Hunks[0].Start != 90 || file.Patch != header+first+last {
+		t.Fatal("source or line ranges changed")
+	}
+	if _, err := PackBounded([]*diff.FileDiff{file}, 5, len(header)+len(first)-1); err == nil {
+		t.Fatal("oversized single hunk accepted")
+	}
+}
+
+func TestPackBoundedKeepsStablePartitionsAndFileLimit(t *testing.T) {
+	header := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n"
+	patch := header
+	for i := 0; i < 10; i++ {
+		patch += "@@ -1 +1 @@\n-old\n+new\n"
+	}
+	files := diff.Parse(patch)
+	pkgs, err := PackBounded(files, 1, 160)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range pkgs {
+		if len(p.Files) > 1 {
+			t.Fatal("split partitions exceeded maxFiles")
+		}
+	}
+	a := &diff.FileDiff{Path: "z/a.go", Patch: "z"}
+	b := &diff.FileDiff{Path: "a/a.go", Patch: "a"}
+	left, _ := PackBounded([]*diff.FileDiff{a, b}, 5, 100)
+	right, _ := PackBounded([]*diff.FileDiff{b, a}, 5, 100)
+	if left[0].Name != right[0].Name {
+		t.Fatal("partition order depends on input order")
+	}
+}

@@ -64,6 +64,8 @@ type Usage struct {
 	PromptTokens     int
 	CompletionTokens int
 	TotalTokens      int
+	Provider         string
+	Model            string
 }
 
 // New 创建 LLM 客户端。
@@ -85,7 +87,7 @@ func New(cfg config.LLMConfig, logger *slog.Logger) *Client {
 	// 初始化备用模型客户端（非递归）
 	if cfg.Fallback != nil && cfg.Fallback.Enabled && !client.isFallback {
 		fallbackCfg := config.LLMConfig{
-			Provider:        "fallback",
+			Provider:        "minimax",
 			APIKey:          cfg.Fallback.APIKey,
 			BaseURL:         cfg.Fallback.BaseURL,
 			Models:          cfg.Fallback.Models,
@@ -126,9 +128,9 @@ func (c *Client) Chat(ctx context.Context, model string, messages []Message) (st
 	}
 	result, usage, err := c.chatWithFallback(ctx, model, messages, false)
 	if err == nil && path != "" && strings.TrimSpace(result) != "" {
-		entry := savedResponse{Version: 1, Key: key, Content: result, ContentHash: digest([]byte(result)), OriginalUsage: usage}
+		entry := savedResponse{Version: 1, Key: key, Content: result, ContentHash: digest([]byte(result)), OriginalUsage: usage, Provider: usage.Provider, Model: usage.Model}
 		if saveErr := writeCheckpoint(path, entry); saveErr != nil {
-			c.logger.Warn("保存模型检查点失败", "error", saveErr)
+			return "", usage, fmt.Errorf("save model checkpoint: %w", saveErr)
 		}
 	}
 	return result, usage, err
@@ -136,6 +138,12 @@ func (c *Client) Chat(ctx context.Context, model string, messages []Message) (st
 
 // chatWithFallback 内部方法，支持主备切换
 func (c *Client) chatWithFallback(ctx context.Context, model string, messages []Message, isFallbackMode bool) (string, Usage, error) {
+	if err := ctx.Err(); err != nil {
+		return "", Usage{}, err
+	}
+	if !c.isFallback && c.fallbackClient != nil && sessionDowngraded(ctx) {
+		return c.callFallback(ctx, model, messages, nil)
+	}
 	if blocked := c.blockedQuota(ctx); blocked != nil {
 		if c.fallbackClient != nil && !isFallbackMode && !c.isFallback {
 			return c.callFallback(ctx, model, messages, blocked)
@@ -144,6 +152,9 @@ func (c *Client) chatWithFallback(ctx context.Context, model string, messages []
 	}
 	var lastErr error
 	for attempt := 1; attempt <= c.cfg.Retry.MaxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return "", Usage{}, err
+		}
 		if err := reserveRequest(ctx, model, messages, c.cfg.MaxTokens); err != nil {
 			return "", Usage{}, err
 		}
@@ -152,9 +163,14 @@ func (c *Client) chatWithFallback(ctx context.Context, model string, messages []
 			return content, usage, nil
 		}
 		lastErr = err
+		if ctx.Err() != nil {
+			return "", usage, ctx.Err()
+		}
 		var quota *QuotaError
 		if errors.As(err, &quota) {
-			c.rememberQuota(ctx, quota)
+			if saveErr := c.rememberQuota(ctx, quota); saveErr != nil {
+				return "", usage, fmt.Errorf("save model quota checkpoint: %w", saveErr)
+			}
 		}
 
 		// 额度/速率限额优先切换备用客户端，不继续重试被限额的供应商。
@@ -163,6 +179,9 @@ func (c *Client) chatWithFallback(ctx context.Context, model string, messages []
 		}
 
 		if !retryable || attempt == c.cfg.Retry.MaxAttempts {
+			if retryable && c.fallbackClient != nil && !isFallbackMode && !c.isFallback {
+				return c.callFallback(ctx, model, messages, err)
+			}
 			break
 		}
 		delay := c.backoff(attempt)
@@ -178,10 +197,17 @@ func (c *Client) chatWithFallback(ctx context.Context, model string, messages []
 }
 
 func (c *Client) callFallback(ctx context.Context, model string, messages []Message, cause error) (string, Usage, error) {
+	if err := ctx.Err(); err != nil {
+		return "", Usage{}, err
+	}
+	downgradeSession(ctx)
 	fallbackModel := c.getFallbackModel(model)
 	c.logger.Warn("主模型限额期间使用备用模型", "model", model, "error", cause)
 	content, usage, err := c.fallbackClient.chatWithFallback(ctx, fallbackModel, messages, true)
 	if err != nil {
+		if cause == nil || ctx.Err() != nil {
+			return "", usage, err
+		}
 		return "", usage, fmt.Errorf("主模型和备用模型均失败: 主模型错误=%w, 备用模型错误=%w", cause, err)
 	}
 	return content, usage, nil
@@ -220,10 +246,10 @@ func (c *Client) chatOnce(ctx context.Context, model string, messages []Message)
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		// Redact before classification and truncation so a length boundary
+		// cannot persist or log a prefix of an echoed credential.
+		body = []byte(c.redact(string(body)))
 		if quota := classifyQuota(resp, body, time.Now()); quota != nil {
-			if c.cfg.APIKey != "" {
-				quota.Message = strings.ReplaceAll(quota.Message, c.cfg.APIKey, "<REDACTED>")
-			}
 			return "", Usage{}, false, quota
 		}
 		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
@@ -236,7 +262,7 @@ func (c *Client) chatOnce(ctx context.Context, model string, messages []Message)
 		return "", Usage{}, false, fmt.Errorf("parse llm response: %w", err)
 	}
 	if parsed.Error != nil {
-		return "", Usage{}, false, fmt.Errorf("llm error: %s", parsed.Error.Message)
+		return "", Usage{}, false, fmt.Errorf("llm error: %s", c.redact(parsed.Error.Message))
 	}
 	if len(parsed.Choices) == 0 {
 		return "", Usage{}, false, fmt.Errorf("llm 返回空 choices")
@@ -246,8 +272,17 @@ func (c *Client) chatOnce(ctx context.Context, model string, messages []Message)
 		PromptTokens:     parsed.Usage.PromptTokens,
 		CompletionTokens: parsed.Usage.CompletionTokens,
 		TotalTokens:      parsed.Usage.TotalTokens,
+		Provider:         c.cfg.Provider,
+		Model:            model,
 	}
 	return parsed.Choices[0].Message.Content, usage, false, nil
+}
+
+func (c *Client) redact(value string) string {
+	if c.cfg.APIKey != "" {
+		return strings.ReplaceAll(value, c.cfg.APIKey, "<REDACTED>")
+	}
+	return value
 }
 
 // backoff 计算第 attempt 次重试的指数退避延迟。
