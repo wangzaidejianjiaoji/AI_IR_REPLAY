@@ -27,65 +27,56 @@ AI_IR_REPLAY（项目名；Go module 即 Go 模块名为 gvs-pr-agent，表示�
 
 | 英文/缩写 | 中文含义 | 在本项目中怎样理解 |
 |---|---|---|
-| AI / LLM | 人工智能 / 大语言模型 | AI 是统称；LLM 是执行文本理解与问题判断的模型 |
-| Agent / baseAgent | 智能体 / 通用审查执行基类 | 一个按专业提示词与规则调用模型的单元；多个角色不等于多个不同模型 |
-| Git / GitHub / Codeup | 版本控制工具 / 两种代码托管平台 | Git 管理提交；GitHub 与阿里云 Codeup 提供仓库、合并请求和评论接口 |
-| PR / MR / Open / WIP | 拉取请求 / 合并请求 / 未关闭状态 / 开发中 | PR 与 MR 在这里都指申请把源分支改动合并到目标分支；Open 不表示已通过审查 |
-| commit / branch / main / HEAD | 提交 / 分支 / 常见主分支名 / 当前指向的提交 | 分支是可移动引用；提交标识用于固定版本。HEAD 在具体语境中指检出提交或分支顶端提交 |
+|  |
 | SHA | 安全散列算法；Git 语境通常指提交的散列标识 | 相当于指定提交的版本指纹，用于固定差异和去重，不是时间、版本序号或“审查通过”标记。本文业务标识为 40 位十六进制值；Git 也支持其他对象格式，不能把所有 SHA 都限定为 40 位 |
 | SOURCE-SHA / SOURCE-REPOSITORY | 知识来源提交标识 / 知识来源仓库标识 | 记录理解文档依据哪个仓库、哪个提交；维护日期不会自动使该版本变为最新 |
 | SHA256 | 256 位安全散列算法 | 对候选问题或文件内容计算摘要；候选 ID 的 SHA256 与 Git 提交 SHA 用途不同 |
-| diff / patch / hunk | 代码差异 / 补丁 / 补丁中的差异块 | diff 表示变化内容；patch 是可保存或应用的变化材料；hunk 记录某段变化及行号范围 |
-| ID / candidate_id | 标识符 / 候选问题标识 | 用于让确认模型只能对指定问题作决定，不能靠同一行号替换成别的问题 |
-| JSON / YAML / Markdown / HTML | 结构化数据 / 配置格式 / 文档标记格式 / 网页标记格式 | 分别用于模型结果、配置、报告和评论隐藏去重标记 |
-| API / SDK / CLI / IDE / MCP | 应用接口 / 开发工具包 / 命令行界面 / 集成开发环境 / 模型上下文协议 | API 是程序通信入口；其余表示不同工具接入方式，不意味着本项目都已支持 |
-| HTTP / GET / POST / TLS / Bearer | 网络请求协议 / 读取方法 / 提交方法 / 传输加密 / 令牌认证方式 | 健康检查用 GET，手动触发用 POST；Bearer 校验令牌，HTTP 服务本身没有 TLS |
-| dry-run / Mock / probe | 试运行 / 模拟服务 / 验证探针 | dry-run 只禁止评论；Mock 用预设响应验证流程；probe 指针对某行为的小型验证程序，不等于线上验收 |
-| Token / tokenizer / Usage | 模型文本单位 / 分词器 / 用量字段 | Token 不等于中文字符或英文单词；Usage 是供应商响应的用量数据，和程序估算预算分开理解 |
+| diff / patch / hunk | 代码差异 / 补丁 / 补丁中的差异块 | diff 表示变化内容；patch 是可保存或应用的变化材料；hunk 记录某段变化及行号范围|
+ |
+|  |
+ |
+Token / tokenizer / Usage | 模型文本单位 / 分词器 / 用量字段 | Token 不等于中文字符或英文单词；Usage 是供应商响应的用量数据，和程序估算预算分开理解 |
 | small / medium / large / kimi-for-coding | 小、中、大模型档位 / 配置的模型名称 | 档位可指向同一模型；8k/32k/128k 的 k 表示千量级名称或规模，不据名称确认真实上下文容量 |
-| Go / C++ / module / package | 编程语言 / 编程语言 / 模块 / 包 | Go module 管理项目依赖；Go package 是代码组织单位；“审查包”另指归并后的变更文件集合 |
+|  |
 | Store / Service / Snapshot / Prepare | 状态存储 / 审查服务 / 快照 / 知识准备方法 | 是源码里的类型或方法名，不是独立平台产品 |
 | mutex / lock / context | 互斥锁 / 锁 / 执行上下文 | 前两者防止同时操作共享资源；context 传递取消、超时和预算范围 |
 | parser / KnownFields / ValidateRuntime | 语法解析器 / 已知字段约束 / 运行配置校验 | 对结构或格式做工程校验，不能证明业务正确或远端接口可用 |
-| CUDA / TensorRT / GPU / infer | 并行计算平台 / 推理优化运行库 / 图形处理器 / 推理服务简称 | 属于被审查业务背景；运行审查二进制不要求安装这些业务 GPU 依赖 |
-| Docker / Compose / ro | 容器工具 / 容器组合部署 / 只读 | ro 只限制挂载目录写入，不阻止容器向外部模型发送代码 |
-| P1 / P2 / Precision / Recall | 处理优先级一/二 / 查准率 / 召回率 | 优先级是内部建议；效果指标需专家标注，不能从评论数量推导 |
-| true / false / enabled / nil / ok | 真/假 / 启用 / 空值或无错误 / 测试通过状态 | 在开关中 true/false 表示开启/关闭；错误返回 nil 表示程序未报告错误；测试 ok 仅覆盖测试范围 |
+ |
 
-## 2. 已实现能力及开关
+## 2. 已实现能力与关键配置
 
-本节回答三个问题：这项能力做什么、什么场景下使用、哪些配置决定它是否执行。审查开关与发布开关分开控制：开启审查不等于允许评论发布，禁止发布也不等于不调用模型。
+本节先说明能力与使用场景，再列出部署和试运行时需要判断的配置。以随附 GVS / infer 业务配置为例，专业角色、文件分包、位置校验、反思去重、知识理解、规则热更新和备用模型已配置启用，日常使用直接按下述流程理解；具体实现见第 3 节，字段含义见第 11 节。这些是业务配置的设置，不代表所有自定义配置均自动启用。
 
-| 能力 | 实际作用 | 典型场景 | 实现位置 | 开关、条件与边界 |
-|---|---|---|---|---|
-| GitHub 未关闭的 PR 审查 | 定期发现尚未合并的代码申请，读取差异并检查是否已审过该输入版本 | 团队使用 GitHub 提交功能或修复，希望在人工合并前收到辅助报告 | internal/github、internal/review | 配置 github.repos；按目标分支过滤，跳过 WIP/冲突，以源/目标 SHA 和输入摘要、共享任务状态及发布回执去重；当前列表没有翻页，范围限制见 3.3；发布另需 notification.pr_comment=true 且 dry_run=false |
-| Codeup 分支增量审查 | 比较已记录基线与分支当前提交，只审查两者之间的变化 | 开发者推送分支但还没有创建合并请求，希望提前发现风险 | internal/codeup、internal/state | codeup.enabled=true；默认首次只记录基线；codeup.review_first_push=true 才在首次对比配置的基准分支；提交评论由 codeup.commit_comment 控制 |
-| Codeup 未关闭的 MR 审查 | 按合并请求版本读取差异，以固定提交版本审查并去重 | 以 Codeup 合并请求作为评审入口，需要对每个新版本形成报告 | internal/review | 需 codeup.enabled=true、codeup.mr_review=true；过滤源分支；审查后版本变化则放弃发布及基线推进；MR 评论另由 codeup.mr_comment 控制 |
-| 指定单个 Codeup MR | 单次处理配置内仓库的指定 MR，不扫描分支推送或其他 MR | 人工复核某个 MR，或失败后复用成功的模型请求 | cmd/agent、internal/review/service.go | -repo 与 -mr 成对指定，编号为正整数，不能与 -diff 混用；绕过轮询分支过滤，仍检查时间窗口、开启状态、WIP、冲突、版本、去重与发布开关；不会强制重审已完成 SHA |
-| 本地补丁审查 | 读取指定差异文件，打印报告，便于验证流程 | 尚未推送代码、复现历史问题、用固定补丁做模型对比或本地演示 | cmd/agent 的 -diff 参数 | -diff 指定补丁路径；不访问 GitHub，但理解开启时仍会访问 Codeup；模型请求仍存在；使用随附本地 Mock（模拟服务）配置时可演示离线流程 |
-| 专业角色审查 | 用不同专业视角分别检查同一变更，再汇总结果 | 同一改动可能同时涉及安全、并发、性能与资源生命周期，需要多角度复核 | internal/agent/factory.go | agents.<角色>.enabled 控制 11 个角色；review.file_packaging.enabled 开启时按路径分配，关闭时全部已启用角色审查单一包；角色数不是固定调用数 |
-| 持久化代码理解 | 保存版本化知识，供变更分析使用 | 持续审核业务仓库 | internal/understanding | 必须校验 SOURCE-REPOSITORY 和有效、一致的 SOURCE-SHA；来源缺失/冲突或仓库不匹配拒绝复用；首次初始化需固定提交源码对象 |
-| 每次变更理解与统筹确认 | 先分析本次改动的意图，再对专业角色发现的问题逐项作确认判断 | 多个角色提出相近问题，或需要结合业务目的判断某变化是否有风险 | internal/analyzer、internal/coordinator/confirmer.go | 随 understanding.enabled 一起装配，当前没有独立开关；关闭时走兼容流程；确认有候选数量及文本预算限制，模型确认不等于人工验收 |
-| 规则优先级与热更新 | 选择当前规则，并组合全局、角色与命中路径的检查要求 | 各项目规范不同，需覆盖默认规则；运行期间调整规则而不重启服务 | internal/rules | -rule、rules.project_path、rules.global_path、内嵌默认按顺序选一份规则；rules.hot_reload 开启轮询当前规则文件，不把四层文件合并 |
-| 定时与手动触发 | 扫描发现任务并持久排队 | 常驻巡检与指定 MR | internal/scheduler、internal/review | 每扫描轮次最多一个实际流水线；同机共享 runtime_dir 串行；按上次尝试时间公平调度；手动触发需令牌，-once 仍受窗口限制 |
-| 报告与平台评论 | 生成包含变更总结、问题、失败与覆盖情况的统一报告 | 研发定位问题、测试核验风险、负责人检查本次是否审查完整 | internal/notifier | notification.pr_comment、codeup.commit_comment、codeup.mr_comment 分别控制三类评论；review.dry_run 禁止发布；均为全局评论，不是逐行 inline（行内）评论 |
-| PR 预算与取消 | 知识、分析、专业作业、确认及重试共享每 PR 尝试预算 | 控制调用量和耗时 | internal/llm/budget.go、internal/review/budget.go | max_llm_calls、max_round_tokens、round_timeout 名称保留；max_round_cost>0 时需主备价格；不是账单硬上限 |
-| 大变更分批审查 | 完整 hunk 拆包、分批分析和确认 | 超大文件或多文件 | internal/packager、internal/coordinator | 总文件上限保留；超大文件可拆完整 hunk，单 hunk/单候选完整证据超限仍失败，不截断 |
-| 模型请求检查点 | 固定版本重跑复用接受的阶段结果和知识快照 | 中断、重启续审 | internal/llm/checkpoint.go、internal/review | 默认 ./data/checkpoints，所有审核入口装配；显式 -checkpoint-dir 空值关闭响应缓存；保存失败阻断完成 |
-| 配额冷却与备用模型 | Kimi → MiniMax；每 PR 新会话，尝试内降级不回跳 | 主供应商不可用 | internal/llm/client.go、session.go | 共享 runtime_dir/models 持久化冷却，与响应缓存分离；网络重试耗尽可降级，普通鉴权错误不冒充配额 |
-| 覆盖及失败披露 | 分开统计文件纳入、文本截断、未确认候选与成功/失败作业 | 判断零问题结果是否具备完整执行前提 | internal/coordinator、internal/notifier、internal/review | Service 遇到任一作业失败、截断包、未确认候选或确认错误即阻断报告发布与成功基线推进；字节覆盖不等于语义覆盖 |
-| 单机实例互斥 | 状态/知识实例锁及跨入口执行槽 | 避免同时审核或写共享资源 | internal/instance、internal/review/runtime.go | Service 各入口在模型前获取共享 runtime_dir/execution.lock；必须同机同目录；非分布式调度 |
+### 2.1 已实现能力
 
-### 2.1 如何理解几个容易混淆的开关
+| 能力 | 实际作用与使用场景 | 需要了解的边界 |
+|---|---|---|
+| GitHub PR 审查 | 轮询未关闭的 PR，按固定源 / 目标版本读取差异，为合并前评审提供报告 | 按目标分支过滤，跳过 WIP / 冲突；当前列表范围限制见 3.3 |
+| Codeup MR 与分支增量审查 | MR 按合并请求版本审查；分支按已记录基线与当前提交之间的变化审查，适合尚未创建 MR 的推送 | MR 轮询过滤源分支；两类入口可能分别审查相关变化，不自动合并调用；版本变化时放弃旧 MR 结果的发布与基线推进 |
+| 指定 MR 与本地补丁 | `-repo` 与 `-mr` 成对指定单个 Codeup MR；`-diff` 读取本地 patch 并打印报告，适合复核、复现和演示 | 两种入口不能混用；指定 MR 仍检查时间窗口、状态、冲突和去重，不强制重审已完成版本；本地模式仍可能请求模型和知识来源，离线演示使用 Mock 配置 |
+| 多专业角色协作 | 按业务模块归并文件、按路径分配专业角色，再按优先级分批执行；批内并发，覆盖安全、并发、性能、资源等视角 | 支持 11 个角色，每包实际参与者由路径决定；角色数不等于固定调用数 |
+| 版本化知识与变更理解 | 维护仓库知识，分析本次改动意图与行为约束，再对专业角色的候选问题逐项确认 | 知识、分析和最终确认属于同一理解链路；专业角色读取共享摘要；首次知识初始化需要固定提交源码对象，模型确认仍需人工核验 |
+| 项目规则与热更新 | 按 CLI、项目、全局、内嵌默认的优先级选择一份规则，并组合其中的全局、角色和路径要求；规则调整后可在运行期加载 | 四个来源不合并；一次审查固定所选规则，避免中途改变依据 |
+| 定位、反思与完整性检查 | 校验文件和行号，检查引用及 Go 建议片段，去重候选并披露覆盖、作业与确认状态 | 任一作业失败、截断或确认不完整都阻断发布与成功基线推进；工程校验和字节覆盖不能证明业务正确 |
+| 大变更分批处理 | 按完整 hunk 拆包，分批分析、归并摘要和确认候选，保留后部变更证据 | 文件总量、单个 hunk 或单候选完整证据超限仍失败，不截断后当作完成 |
+| 排队、串行审核与中断恢复 | 定时或手动触发扫描，持久排队；同机共享执行槽串行审核 PR，利用检查点复用已接受的模型响应和知识快照 | 每轮扫描最多启动一个实际流水线；单 PR 内角色可并发；缓存保存失败阻断完成，重跑仍需版本与发布检查 |
+| 主备模型与配额冷却 | Kimi 不可用时按策略切到 MiniMax；每 PR 尝试新建会话，该次降级后不回跳，供应商冷却跨实例保留 | 网络重试耗尽也可降级；普通鉴权错误不当作配额耗尽；重试和备用请求仍消耗预算 |
+| 统一报告与发布存证 | 生成变更总结、问题、覆盖和失败信息，输出到日志或平台评论，并记录发布回执 | 平台输出为全局评论；回执减少重复发布，远端评论与本地落盘仍不是原子事务 |
 
-- **审查入口**：github.repos 配置 GitHub 仓库；codeup.enabled 启用 Codeup；在此基础上 codeup.mr_review 决定是否审查 MR。分支审查与 MR 审查可能对相关变更分别执行，不能假定启用两者会自动跨入口合并调用。
-- **理解开关**：understanding.enabled 同时启用持久化知识、每次变更分析和最终确认，不能按三个独立按钮理解。understanding.strict=true 表示知识准备报错就停止，false 表示披露降级后继续；来源仓库不匹配时返回空快照和错误，不复用错误仓库知识。
-- **工程校验开关**：review.comment_location.enabled 控制位置校验；review.comment_reflection.enabled 控制反思过滤与去重。它们帮助约束输出，不替代业务测试。
-- **发布开关**：三种平台评论开关分别控制目标。review.dry_run=true（试运行、禁止发布）仍可能调用外部模型、收费并改写本地状态/知识，不是“完全不产生副作用”。
-- **状态与知识路径**：codeup.state_path 保存已审基线；understanding.document_path 保存业务知识。试点与正式环境、GVS 与 infer 应使用独立路径，防止互相影响。
-- **检查点开关**：review.checkpoint_dir 默认 ./data/checkpoints，各入口装配；CLI 显式 -checkpoint-dir 空值可关闭响应缓存。任务清单、执行锁、冷却与发布回执位于 review.runtime_dir（默认 ./data/review-runtime，环境变量 AGENT_REVIEW_RUNTIME_DIR 可覆盖），不随响应缓存关闭。
+### 2.2 需要重点确认的配置
 
-未实现：全仓扫描、IDE（集成开发环境）插件、MCP（模型上下文协议）工具检索、自动修复、自动学习规则、分布式调度锁。它们是可讨论的扩展方向。本地 Git 快照读取用于知识初始化，不能等同于已实现全仓缺陷扫描。
+| 决策事项 | 关键配置 | 如何选择及影响 |
+|---|---|---|
+| 审查哪些变更 | `github.repos`、`codeup.repos`、`branch_filter`、`review.include_paths/exclude_paths` | 明确仓库、分支和文件范围；被过滤内容不进入审查。指定 MR 绕过轮询分支过滤，但不绕过去重、状态与版本校验 |
+| 是否对外发布 | `review.dry_run`、`notification.pr_comment`、`codeup.commit_comment`、`codeup.mr_comment` | `dry_run=true` 禁止全部评论发布；正式发布还需对应评论开关允许。GVS / infer 配置当前发布 MR 评论、不发 commit 评论；试运行仍可能收费、写知识和推进 Codeup 基线 |
+| 首次发现分支如何处理 | `codeup.review_first_push` | 当前业务配置为 `false`，首次只记录 HEAD；设为 `true` 才与配置的基准分支比较并审查。该选择影响首次审查工作量及模型消耗 |
+| 知识失败时是否继续 | `understanding.strict`、`source_repository/source_branch`、`snapshot_repository` | 当前业务配置 `strict=false`，更新失败可披露降级后使用可信旧知识，无法取得合法快照时可能以空知识继续；要求知识准备成功时设为 `true`。首次初始化需补齐本地源码仓库；缺失来源、来源不匹配或冲突 SHA 的知识拒绝复用 |
+| 可接受的审查规模与成本 | `max_files_per_review`、`max_diff_chars`、`max_llm_calls`、`max_round_tokens`、`round_timeout`、`max_round_cost` | 文件数和差异字节决定审查规模；调用次数、估算预留量和时长限制按每 PR 实际尝试建立，重试和主备共享预算。金额上限大于 0 时需配置主备价格，估算不等于账单硬上限 |
+| 状态隔离与恢复 | `codeup.state_path`、`understanding.document_path`、`review.checkpoint_dir`、`review.runtime_dir` | GVS / infer、试点 / 正式环境分别隔离基线与知识；参与串行调度的同机实例共用运行目录。检查点默认 `./data/checkpoints`，任务、锁、冷却和回执位于运行目录，不能把清缓存当作清除成功基线 |
+| 模型服务与备用凭据 | `llm.api_key/base_url/models`、`llm.fallback` 中的对应字段 | 主备端点、模型和凭据均需可用；档位可指向同一模型。启用备用策略不保证备用服务有权限或配额，真实可用性需请求验证 |
+| 审查时段与手动触发权限 | `review.active_hours`、`server.admin_token`、`server.addr` | 时间窗口约束常驻扫描、`-once` 和指定 MR；本地 diff 不受该窗口限制。HTTP 手动触发需要令牌，非回环监听必须配置令牌；接受触发不等于审核完成 |
+
+能力边界：尚未实现全仓缺陷扫描、IDE 插件、MCP 工具检索、自动修复、自动学习规则和分布式调度锁。本地 Git 快照只用于知识初始化；单机互斥要求实例使用同一共享运行目录。
 
 ## 3. 整体架构与数据流
 
