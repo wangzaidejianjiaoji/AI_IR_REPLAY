@@ -41,6 +41,7 @@ type mockCodeup struct {
 	branches       []map[string]any         // ListBranches 返回
 	compareFail    bool                     // GetCompare 返回 500
 	compareCalls   []string                 // 记录 "from..to"
+	compareModes   []string                 // straight=true means direct snapshot comparison
 	compareDiffs   []map[string]any         // GetCompare 返回的 diffs（nil 时用 sampleDiff 兜底）
 	commitComments map[string][]string      // sha -> 评论正文
 	mrs            []map[string]any         // ListOpenChangeRequests 返回
@@ -115,6 +116,7 @@ func (m *mockCodeup) handle(w http.ResponseWriter, r *http.Request) {
 		}
 		q := r.URL.Query()
 		m.compareCalls = append(m.compareCalls, q.Get("from")+".."+q.Get("to"))
+		m.compareModes = append(m.compareModes, q.Get("straight"))
 		diffs := m.compareDiffs
 		if diffs == nil {
 			diffs = []map[string]any{{
@@ -618,7 +620,7 @@ func TestMRReviewUsesUnderstandingAndFinalConfirmation(t *testing.T) {
 		var content string
 		switch {
 		case strings.Contains(system, "全局代码理解维护 Agent"):
-			content = "# GVS 全局代码理解\n\n- qatool 负责质量检测。"
+			content = `{"replacements":[],"append":"# GVS 全局代码理解\n\n- qatool 负责质量检测。"}`
 		case strings.Contains(system, "代码变更意图分析器"):
 			content = `{"summary":"调整 qatool 校验","intent":"验证测试流程","affected_modules":["qatool"],"behavior_constraints":["保持退出码语义"],"comment_logic_mismatches":[]}`
 		case strings.Contains(system, "最终代码审查统筹确认 Agent"):

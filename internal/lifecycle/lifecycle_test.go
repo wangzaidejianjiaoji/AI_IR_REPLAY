@@ -2,6 +2,7 @@ package lifecycle
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"os"
 	"os/exec"
@@ -10,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gvs-pr-agent/internal/progress"
 )
 
 // A copied test executable serves as an isolated agent/controller for the real
@@ -219,14 +222,25 @@ func TestStopTerminatesSelectedAgentAndPreservesOtherWorkspace(t *testing.T) {
 		return cmd, done
 	}
 	root := t.TempDir()
-	_, selected := start(root)
+	selectedAgent, selected := start(root)
 	_, other := start(t.TempDir())
+	statusPath := filepath.Join(root, "data", "runtime", "gvs.status.json")
+	if err := os.MkdirAll(filepath.Dir(statusPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	status, _ := json.Marshal(progress.Snapshot{PID: selectedAgent.Process.Pid, State: "reviewing", Task: "MR-8", Title: "Audit streamer", StartedAt: time.Now(), UpdatedAt: time.Now(), TotalTokens: 150})
+	if err := os.WriteFile(statusPath, status, 0600); err != nil {
+		t.Fatal(err)
+	}
 	var out bytes.Buffer
 	if err := Run(root, "status", "gvs", &out); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), "agent=") {
 		t.Fatalf("agent missing from status: %s", &out)
+	}
+	if !strings.Contains(out.String(), "Audit streamer") || !strings.Contains(out.String(), "tokens=150") {
+		t.Fatalf("runtime details missing: %s", &out)
 	}
 	if err := Run(root, "stop", "gvs", &out); err != nil {
 		t.Fatal(err)

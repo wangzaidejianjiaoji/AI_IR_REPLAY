@@ -19,7 +19,7 @@ import (
 func TestRejectedKnowledgeResponseIsNotReplayedAfterRestart(t *testing.T) {
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		content := "# Correct knowledge"
+		content := `{"replacements":[],"append":"# Correct knowledge"}`
 		if calls.Add(1) == 1 {
 			content = "```markdown\n```"
 		}

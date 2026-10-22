@@ -1,11 +1,13 @@
 <!-- SOURCE-MODULE: gvs-pr-agent -->
-<!-- SOURCE-SHA: 14eec0537a24ed10d33b7fb6d6d6cbdbc709ded1 -->
+<!-- SOURCE-SHA: fd13ba6be450ba75f91ed2c795961e1b4f54f145 -->
 
 # AI_IR_REPLAY 项目理解
 
 AI_IR_REPLAY 是一个 Go 实现的 AI 代码审查服务，Go module 与主程序名为 `gvs-pr-agent`。它从 GitHub PR、Codeup MR / 分支或本地 patch 获取变更，结合规则和可选的业务知识，组织多个专业角色审查，校验候选问题并生成 Markdown 报告；配置允许时将报告发布为平台评论。
 
-> 维护日期：2026-10-16。源码基线：`14eec0537a24ed10d33b7fb6d6d6cbdbc709ded1`。本文按当前源码、配置和测试定义核对，采用 L0 系统关系、L1 模块职责、L2 调用链、L3 契约的粒度。它不代表真实供应商、远端评论、部署环境或缺陷检出率已经验收。
+> 维护日期：2026-10-19。源码核对范围：`fd13ba6be450ba75f91ed2c795961e1b4f54f145` 及当前工作区的运行状态、理解增量更新和 Codeup MR 增量审核实现。本文兼顾上手入口与项目理解，采用 L0 系统关系、L1 模块职责、L2 调用链、L3 契约的粒度。它不代表真实供应商、远端评论、部署环境或缺陷检出率已经验收。
+
+本次更新包含三项：Linux `status` 展示正在审核的任务、角色/包、耗时和实际返回 token；理解文档按差异分批应用补丁；Codeup MR 后续版本只审核相对上次成功版本的差异。标题/描述变化不触发重审，详细规则见下文及 [运行与增量审核说明](docs/persistent-control.md)。
 
 ## 0. 文档范围与阅读入口
 
@@ -22,6 +24,19 @@ AI_IR_REPLAY 是一个 Go 实现的 AI 代码审查服务，Go module 与主程�
 | 凭据注入与环境配置 | [环境说明](env.md) |
 
 历史文档和代码注释可能描述旧实现。出现冲突时，沿本文列出的函数核对目标提交；维护日期较新也不等于所有段落均已重新验证。本文是人工维护的导航文档，不会自动成为 `understanding.document_path` 指定的运行期知识。
+
+### 0.1 按目的选择入口
+
+| 现在要做什么 | 从哪里开始 | 成功判断 |
+|---|---|---|
+| 首次了解工程能否运行 | [第 5 节 Mock 演示](#5-构建演示与部署入口) | 本地 diff 命令正常退出并输出报告；不是模型质量验收 |
+| 只看一个 Codeup MR | `-repo` 与 `-mr`，或常驻脚本 manual 模式 | 核对选定仓库、版本、审核结果和发布开关；不存在 GitHub 单 PR 指定参数 |
+| 持续扫描多个仓库 | 常驻 scheduled 模式 | 守护/审核进程存在、扫描持续、队列有进展；单看 PID 不够 |
+| 查调用链或修改实现 | 本文第 2～4 节，再看技术框架对应包 | 明确入口、身份、失败条件及持久化责任 |
+| 排查不审、不发或重复调用 | [第 6.1 节](#61-常见现象与检查顺序) | 用源/目标版本、任务、回执与平台评论交叉核对 |
+| 升级或迁移运行环境 | 部署与验收、常驻启停文档 | 旧实例退出、新二进制与配置明确、持久目录和权限完整 |
+
+上手前先明确三件事：审核来自哪个平台/仓库，当前使用哪个状态与知识路径，是否允许评论。随附业务配置可能允许真实发布；`-dry-run` 阻止评论，但仍可能产生模型费用、写知识和推进基线。不同入口可能分别处理同一业务改动，不自动合并成一次审查。
 
 ## 1. L0：系统上下文与运行边界
 
@@ -103,14 +118,20 @@ flowchart LR
 
 当前是**扫描可重叠、PR 审核串行、单 PR 内专业作业可并行**。共享目录必须解析到同机同一位置，并具有有效文件锁语义；不同路径、主机或旧版二进制没有共同互斥保障。
 
+一分钟是发现间隔，不是审核完成时限。扫描取得平台列表并登记候选后，非阻塞尝试 `execution.lock`；被占用就结束本轮领取，待审记录保留。普通失败默认一分钟后重试，配额使用未来 `RetryAt`；队列还受最近扫描时间与任务所有者约束。进程退出释放锁，仍存活的卡住进程不会自动失锁。详细五层机制见 [项目说明 3.11.1](GO_AI_PR_Review.md#3111-每分钟扫描时如何防止重复审查)。
+
 | 入口 | 审查身份与差异来源 |
 |---|---|
 | GitHub PR | 轮询过滤目标分支；源 SHA、目标 SHA、标题 / 描述和配置 / 规则依赖参与版本识别；使用固定 SHA compare，获取 diff 后及发布前复查版本、状态和元数据 |
-| Codeup MR | 轮询过滤源分支，手动指定模式绕过该分支过滤；源 / 目标 SHA、MR 元数据及配置依赖参与识别；目标分支单独变化也可触发重审 |
+| Codeup MR | 轮询过滤源分支，手动指定模式绕过该分支过滤；按已成功审核的源 / 目标 SHA 去重，标题 / 描述修改不触发审核。目标 SHA 相同的新源版本只审核上次成功源版本到当前版本的直接差异；首次或目标基线变化时审核完整 MR 差异 |
 | Codeup 分支 | 持久基线与当前 HEAD 的 compare；首次发现且 `review_first_push=false` 时只记录基线；相同 HEAD 已完成后仅改规则 / 配置不会触发分支重审 |
 | 本地 diff | 标题、patch 内容及配置 / 规则依赖形成响应缓存身份，不需要远端 PR |
 
 固定版本复查与远端发布之间仍有时间窗口，平台 API 与本地文件不是跨系统事务。
+
+Codeup MR 示例：v5 成功后，v6 只审 v5 → v6；v6 失败则基线仍是 v5，后续 v7 审 v5 → v7。版本间直接比较两个提交的文件树；差异为空时，复查版本后推进基线，不调用模型、不发布报告。报告注明增量起止 SHA，检查点和发布回执包含起点。目标 SHA 变化仍完整复查；旧源提交不可读取则报错保留基线。沿用原状态文件，无需清空旧记录；仅修改规则/配置也不会让相同成功代码快照重审。这些规则针对 Codeup MR，GitHub PR 保持原流程。
+
+当前发现范围有分页限制：GitHub Open PR 仅第一页，评论存证查询仅首 100 条；Codeup 开启 MR 仅第一页，指定 MR 也从这份列表选择；Codeup 分支最多 20 页、每页最多 100。仓库候选量超过范围时可能未被发现，不能把“本轮无任务”直接解释为全部已审。关闭 `commit_comment` 只关闭分支评论，不关闭分支扫描或模型调用。
 
 ### 3.3 共享审查流水线
 
@@ -197,7 +218,7 @@ flowchart LR
 
 运行期知识使用 `SOURCE-REPOSITORY` 和 `SOURCE-SHA` 标记。来源不匹配、版本化文档缺少仓库标记、多个有效 SHA 标记冲突时，管理器拒绝该文档，且不把它作为合法旧快照返回。普通更新失败时，`strict=true` 阻断；`strict=false` 可使用返回的合法旧快照，若无合法快照则以空知识降级。
 
-首次快照只读取固定提交的 Git blob，选择源码、协议、配置和构建文本并附内容哈希，范围由 [snapshot.go](internal/understanding/snapshot.go) 的白名单定义；例如 JS、Python、JSON 和 Markdown 不在当前快照白名单中。不包含未提交工作区内容，也不是业务全仓运行验收。初始快照默认上限 1000000 字节；增量更新的已有文档 / delta 上限分别为 60000 / 90000 字节，超限保留旧版本并报错，不能把截断输入标为已同步。随附 Codeup 配置尚未填写 `snapshot_repository`，从无版本知识开始部署时必须补齐，seed 不能替代源码快照。
+首次快照只读取固定提交的 Git blob，选择源码、协议、配置和构建文本并附内容哈希，范围由 [snapshot.go](internal/understanding/snapshot.go) 的白名单定义；例如 JS、Python、JSON 和 Markdown 不在当前快照白名单中。不包含未提交工作区内容，也不是业务全仓运行验收。初始快照默认上限 1000000 字节；后续增量更新按批次处理全部 diff，每批最多 12000 字节原始证据，发送受限的相关旧知识片段并应用精确替换/追加补丁，不再因全文超过 60000 字节或累计 delta 超过 90000 字节直接拒绝。全部批次成功才写入新版本；失败保留旧版本。详见 [增量更新与运行状态](docs/persistent-control.md)。随附 Codeup 配置尚未填写 `snapshot_repository`，从无版本知识开始部署时必须补齐，seed 不能替代源码快照。
 
 知识跟踪来源分支，未必与本次 PR 源 / 目标 SHA 相同；报告中的知识版本必须独立解读。GVS 与 infer 应配置不同知识文件和状态文件。旧业务知识文档中“来源仓库隔离测试目前失败”的历史表述不能直接用于当前代码；目前实现已有来源拒绝逻辑和对应测试，测试执行结果需另行记录。
 
@@ -214,7 +235,7 @@ flowchart LR
 | `checkpoint_dir` | 模型响应和固定知识快照；版本、请求、规则、配置依赖变化会影响复用 |
 | `taskTracker` | 进程内任务领取与完成去重，状态含 pending/reviewing/completed/failed；与持久清单不是同一状态机 |
 
-`dry-run`、关闭评论、首次只建基线、筛选后无文件都可能正常推进 Codeup 基线，不能等同于已发布审查报告。成功基线、知识写入和此前已发评论不会因后续任务失败而回滚。删除缓存不会清除成功基线；取消 dry-run 会改变 GitHub PR / Codeup MR 的输入签名，使相同 SHA 也可能重新审查，但同 HEAD 的 Codeup 分支仍被基线跳过。仅打开评论开关也不能保证补发，试点应隔离状态与知识。
+`dry-run`、关闭评论、首次只建基线、筛选后无文件都可能正常推进 Codeup 基线，不能等同于已发布审查报告。成功基线、知识写入和此前已发评论不会因后续任务失败而回滚。删除缓存不会清除成功基线；取消 dry-run 会改变输入签名及缓存匹配，GitHub PR 可能重审，但相同成功源/目标 SHA 的 Codeup MR、同 HEAD 的 Codeup 分支仍被基线跳过。仅打开评论开关也不能保证补发，试点应隔离状态与知识。
 
 ### 4.6 管理 HTTP 契约
 
@@ -225,6 +246,8 @@ flowchart LR
 ## 5. 构建、演示与部署入口
 
 从项目根目录执行，准备 Go 1.23 或兼容工具链；平台、模型和知识初始化权限按实际配置提供。以下本地 Mock 演示不需要真实 API key。
+
+### 5.1 本地 Mock：先验证接线与报告
 
 终端一启动固定响应服务：
 
@@ -247,6 +270,10 @@ AGENT_REVIEW_RUNTIME_DIR=./data/readme-demo/runtime go run ./cmd/agent -config c
 
 Mock 监听 `127.0.0.1:19090`，按角色返回预设问题和固定 Usage；Mock 配置未开启知识 / 分析 / 最终确认链路。这只能验证接线和报告处理，不用于衡量模型准确率、费用或完整知识链路。演示结束可关闭终端，避免将临时环境覆盖带入正式运行。
 
+期望看到 `开始审查`、各专业作业及最终 Markdown。若筛选后无文件或命令非零退出，应先查看错误；不要只寻找“通过”字样。重复使用同一演示目录可能命中检查点，因此再次运行不一定重新请求 Mock。
+
+### 5.2 业务配置与单次运行
+
 构建和单次审查的常用入口：
 
 ```sh
@@ -262,7 +289,44 @@ go run ./cmd/agent -config configs/config-gvs.yaml -repo lizheng/lzvsg/gvs -mr 1
 
 后两条会使用业务配置并访问真实服务；dry-run 仍可能计费和推进状态。执行手动 MR 前需要停止持有相同状态 / 知识锁的定时实例，或准备隔离配置。已有真实审核进程运行时不要覆盖其二进制；正式切换流程见 [部署与验收](docs/deployment-and-acceptance.md)。
 
+准备业务运行环境时，逐项核对以下依赖；这里列出变量名，不填写真实值：
+
+| 项目 | 需要准备的内容 |
+|---|---|
+| 模型 | 业务配置引用 `KIMI_API_KEY`，启用备用还需 `MiniMax_API_KEY`；确认端点、模型名和预算 |
+| Codeup | `CODEUP_ORG_ID`、`CODEUP_TOKEN`，可读取目标仓库；正式发布还需相应评论权限 |
+| GitHub | 配置目标仓库；私有读取或评论按平台权限提供 `GITHUB_TOKEN` |
+| 知识 | 正确的来源仓库、分支和文档；首次初始化补齐 `snapshot_repository` 与固定 commit 对象 |
+| 状态与缓存 | 各实例隔离基线与知识，共享实际执行用 runtime；确认目录可写且有足够空间 |
+| 管理服务 | 常驻模式按配置监听；需要触发时提供 `AGENT_ADMIN_TOKEN`，避免端口冲突 |
+
+程序不自动读取 `.env`。PowerShell 可由受控外部脚本注入变量，Bash 可 export 或由启动脚本加载外部环境文件。裸 CLI 的 `-dry-run` 能强制禁发；常驻守护和 manual 路径会清除 `AGENT_REVIEW_DRY_RUN`，scheduled 又不接受 manual 专用的 DryRun 参数，定时试点必须核对 YAML，手动运行显式传 DryRun 参数。
+
+试点配置应复制为独立文件并隔离 `codeup.state_path`、`understanding.document_path`，必要时使用独立响应目录；同机需要协调的试点和正式实例仍应共用执行锁目录。只改 `-checkpoint-dir` 不能隔离基线或知识。恢复续审时还应保持相关配置身份稳定，改变预算、目录或 dry-run 可能使缓存不匹配。
+
+### 5.3 常驻管理与容器
+
 常驻入口是 `start-persistent.ps1` / `start-persistent.sh`，支持 start、stop、restart、status。它们配合 `run-persistent.*` 和 `internal/lifecycle` 工作，已有二进制不保证与当前源码一致。[Dockerfile](Dockerfile) 提供多阶段构建，[docker-compose.yml](docker-compose.yml) 挂载 configs/data/docs；首次知识初始化还需容器可见的业务 Git 对象，不能仅靠这三个挂载推断已具备初始化条件。
+
+在管理工具已构建后，可从项目根目录检查或停止指定实例：
+
+```powershell
+.\start-persistent.ps1 -Action status
+.\start-persistent.ps1 -Action stop -Instance gvs
+```
+
+```sh
+bash ./start-persistent.sh --action status
+bash ./start-persistent.sh gvs --action stop
+```
+
+这些是操作示例，不自动执行启停。status 除进程信息外还显示当前/最近审核的任务、标题、阶段、角色与包、开始时间、耗时及实际返回的 token 用量；状态每 15 秒更新，陈旧或不匹配进程的文件不会作为实时状态展示。stop 会中断工作；stop/status/restart 不能混用 MR、模式或检查点参数。首次构建独立管理工具、凭据文件位置及手动调用详见常驻启停文档。
+
+持续观察 infer 可运行 `watch -n 2 'bash ./start-persistent.sh gvs-infer --action status'`。耗时覆盖整个尝试；token 累计本次新请求已返回的供应商 usage，缓存命中不重复计数。等待中的请求尚无 usage，`usage_missing` 表示缺失用量，显示值可能低于实际账单；它不是预算预留值。重试从新的尝试重新计数。升级需重建审核程序及独立管理工具（若使用），再重启才能显示新字段。
+
+注意区分 `data/runtime`（脚本日志/PID、审核状态 JSON）与 `data/review-runtime`（执行锁、任务、冷却、回执）。程序默认管理端口为 8081，GVS YAML 为 8083、infer YAML 为 8082；Windows 常驻脚本可覆盖 GVS 为 8081，最终以启动环境和日志为准。
+
+Compose 默认注入 dry-run=true，管理令牌为必填；若切到 GVS/infer 备用模型配置，应补传当前 Compose 未声明的 `MiniMax_API_KEY`。容器内配置不能沿用宿主 Windows 的 Git 路径。升级或迁移前备份基线、知识、runtime 和检查点，停止全部旧实例后再构建启动。
 
 ## 6. 验证入口与已知边界
 
@@ -274,11 +338,33 @@ go run ./cmd/agent -config configs/config-gvs.yaml -repo lizheng/lzvsg/gvs -mr 1
 | 完整 hunk 与大变更处理 | `internal/packager/packager_test.go`、`internal/analyzer/batches_test.go`、`internal/review/large_review_test.go` |
 | 候选 ID、完整决定与证据预算 | `internal/coordinator/confirmation_protocol_test.go`、`candidate_limits_test.go` |
 | 知识来源、首次快照与失败回退 | `internal/understanding/provenance_test.go`、`snapshot_test.go`、`fallback_test.go` |
+| 理解增量分批与补丁校验 | `internal/understanding/incremental_test.go` |
+| MR 版本增量、空差异及元数据跳过 | `internal/review/mr_incremental_test.go`、`runtime_test.go` |
+| 运行进度及实际 usage | `internal/progress/progress_test.go`、`internal/llm/progress_test.go`、`internal/review/progress_test.go` |
 | 单机串行、续审、版本与发布 | `internal/review/runtime_test.go`、`resume_test.go`、`github_snapshot_test.go`、`publication_test.go` |
 | 主备路由、配额和响应缓存 | `internal/llm/fallback_test.go`、`quota_test.go`、`checkpoint_test.go` |
 | 平台进程启停 | `internal/lifecycle/lifecycle_test.go`、`tools/test-start-modes.*`、`tools/test-persistent-linux.sh` |
 
-这里列出的是验证入口，不声明本次文档更新已重新执行全部测试。Windows 原生测试、Git Bash 验证、Linux 交叉编译、Linux 原生运行和 race 检查是不同证据，不能互相替代。
+这里列出的是验证入口。2026-10-19 状态与理解更新实现后全量 Go 测试及 vet 通过；追加 MR 增量后，审核/Codeup 模块回归、vet 和 Linux amd64 构建通过。一次队列测试偶发失败未复现，重复单测及模块重跑通过，已补充诊断；详情见项目说明第 8 节。本次仅同步文档并检查一致性。Windows 原生测试、Git Bash 验证、Linux 交叉编译、Linux 原生运行和 race 检查是不同证据，不能互相替代。
+
+### 6.1 常见现象与检查顺序
+
+| 现象 | 优先核对 | 不能直接推出 |
+|---|---|---|
+| 每分钟扫描却没有新审核 | 时间窗口 → 平台列表范围 → WIP/冲突/分支过滤 → 已完成身份 → 执行锁/归属/RetryAt | 调度器坏了，或仓库全部已审 |
+| `另一个实例正在审核 PR；本次不领取` | 同机共享目录及持锁进程；正常等待后续扫描 | 应删除 execution.lock 或启动更多实例 |
+| 已有“审查完成”，没有平台评论 | 后续完整性错误 → 版本变化 → dry-run/评论开关 → 回执 | 已发布成功或平台必然故障 |
+| 指定 MR 提示找不到 | 编号与配置仓库、开启状态、MR 列表第一页范围 | 任意 MR 编号都能直接按 ID 读取 |
+| 重启后又调用模型 | 输入版本/规则/配置、响应目录、缓存完整性、消费者校验 | 检查点完全无效 |
+| 去掉 dry-run 仍未补发 | Codeup 分支 HEAD / MR 双 SHA 基线、GitHub 输入摘要、任务及回执 | 试运行天然支持同版本补发 |
+| 配额后一直未恢复 | RetryAt、主备账号与共享冷却、当前是否需要新请求 | 一分钟扫描等于一分钟后一定可用 |
+| 评论成功但保存回执失败 | 先核对平台评论及身份，再处理权限/容量 | 可以安全删掉记录无限重试 |
+
+### 6.2 试点验收要记录什么
+
+至少记录源码/二进制版本、配置标识、模式与发布开关、仓库和源/目标/知识 SHA、命令退出码、各阶段错误、作业成功/失败与候选确认数、实际 Usage 和报告位置。然后人工核对问题真实性及发布版本。保留这份记录才能比较不同规则、模型和预算，不能只比较评论数量。
+
+本次测试范围与实际结果统一记在 [项目说明第 8 节](GO_AI_PR_Review.md#8-当前实现验证结果与剩余问题)，历史全量和平台验收分别解读。
 
 审查与运维时还应明确以下边界：
 

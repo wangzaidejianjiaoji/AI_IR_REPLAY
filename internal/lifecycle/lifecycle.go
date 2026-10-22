@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"gvs-pr-agent/internal/progress"
 )
 
 type process struct {
@@ -139,6 +141,13 @@ func Run(root, action, name string, output io.Writer) error {
 				fmt.Fprintf(output, " %s=%d", match(root, instance, p), p.PID)
 			}
 			fmt.Fprintln(output)
+			for _, p := range found {
+				if match(root, instance, p) == "agent" {
+					if err := progress.Print(filepath.Join(root, "data", "runtime", instance+".status.json"), p.PID, output); err != nil {
+						fmt.Fprintf(output, "  review status unavailable: %v\n", err)
+					}
+				}
+			}
 		} else if err := stop(root, instance, output); err != nil {
 			failures = append(failures, err)
 		}

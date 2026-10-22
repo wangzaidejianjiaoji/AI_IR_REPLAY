@@ -53,7 +53,7 @@ func TestFocusedMRResumePinsKnowledgeAndCompletedAnalysis(t *testing.T) {
 						http.Error(w, "knowledge provider temporarily unavailable", 503)
 						return
 					}
-					content = "# PINNED-main-one\n\nDocument prepared before interruption."
+					content = `{"replacements":[{"old":"# PINNED-seed-old","new":"# PINNED-main-one\n\nDocument prepared before interruption."}],"append":""}`
 				case strings.Contains(system, "代码变更意图分析器"):
 					analysisCalls.Add(1)
 					if !strings.Contains(user, expectedKnowledge) || strings.Contains(user, "UNRELATED-main-two") {

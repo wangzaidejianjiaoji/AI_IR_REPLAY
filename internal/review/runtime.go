@@ -13,6 +13,7 @@ import (
 
 	"gvs-pr-agent/internal/instance"
 	"gvs-pr-agent/internal/llm"
+	"gvs-pr-agent/internal/progress"
 )
 
 var errReviewBusy = errors.New("另一个实例正在审核 PR；本次不领取")
@@ -281,6 +282,8 @@ func (s *Service) runTask(ctx context.Context, key, version string, fn func(cont
 		round = llm.WithReviewSession(round)
 		round = llm.WithQuotaDirectory(round, filepath.Join(s.cfg.Review.RuntimeDir, "models"))
 		round = context.WithValue(round, pinnedRulesKey{}, s.rulesStore.Current())
+		finishProgress := progress.Begin(round, key, version)
+		round = progress.ReviewContext(round)
 		err := fn(round)
 		if err == nil {
 			err = round.Err()
@@ -291,7 +294,13 @@ func (s *Service) runTask(ctx context.Context, key, version string, fn func(cont
 			}
 		}
 		if saveErr := s.queue().finish(ctx, key, err, version); saveErr != nil {
+			finishProgress("interrupted")
 			return errors.Join(err, saveErr)
+		}
+		if err == nil {
+			finishProgress("completed")
+		} else {
+			finishProgress("interrupted")
 		}
 		return err
 	})
@@ -342,6 +351,8 @@ func (s *Service) executeCollected(ctx context.Context, candidates []reviewCandi
 		round = llm.WithReviewSession(round)
 		round = llm.WithQuotaDirectory(round, filepath.Join(s.cfg.Review.RuntimeDir, "models"))
 		round = context.WithValue(round, pinnedRulesKey{}, s.rulesStore.Current())
+		finishProgress := progress.Begin(round, c.key, job.Version)
+		round = progress.ReviewContext(round)
 		err = c.execute(round)
 		if err == nil {
 			err = round.Err()
@@ -353,7 +364,13 @@ func (s *Service) executeCollected(ctx context.Context, candidates []reviewCandi
 		}
 		cancel()
 		if saveErr := q.finish(ctx, c.key, err, job.Version); saveErr != nil {
+			finishProgress("interrupted")
 			return errors.Join(err, saveErr)
+		}
+		if err == nil {
+			finishProgress("completed")
+		} else {
+			finishProgress("interrupted")
 		}
 		if attempt.started || err != nil {
 			return err

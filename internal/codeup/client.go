@@ -114,8 +114,21 @@ func (c *Client) ListBranches(ctx context.Context, repoID string) ([]*Branch, er
 // 标准 unified diff 文本（补全 diff --git 头，供 diff.Parse 解析）。
 // from/to 可为 CommitSHA、分支名或标签名；默认使用 Merge-Base 比较。
 func (c *Client) GetCompareDiff(ctx context.Context, repoID, from, to string) (string, []CommitInfo, error) {
+	return c.getCompareDiff(ctx, repoID, from, to, false)
+}
+
+// GetVersionDiff compares the exact trees of two reviewed source versions.
+// Unlike merge-base comparison, this includes reversions after rebase/force-push.
+func (c *Client) GetVersionDiff(ctx context.Context, repoID, from, to string) (string, []CommitInfo, error) {
+	return c.getCompareDiff(ctx, repoID, from, to, true)
+}
+
+func (c *Client) getCompareDiff(ctx context.Context, repoID, from, to string, straight bool) (string, []CommitInfo, error) {
 	u := fmt.Sprintf("%s/compares?from=%s&to=%s",
 		c.repoBase(repoID), url.QueryEscape(from), url.QueryEscape(to))
+	if straight {
+		u += "&straight=true"
+	}
 	var res compareResult
 	if err := c.getJSON(ctx, u, &res); err != nil {
 		return "", nil, fmt.Errorf("get compare %s %s..%s: %w", repoID, short(from), short(to), err)

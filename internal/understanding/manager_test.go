@@ -40,6 +40,9 @@ func (f *fakeModel) Chat(_ context.Context, _ string, messages []llm.Message) (s
 	if len(messages) > 1 {
 		f.user = messages[1].Content
 	}
+	if strings.Contains(f.user, `"current_passages"`) {
+		return `{"replacements":[],"append":"## 模块\n- qatool：质量检测工具。"}`, llm.Usage{TotalTokens: 20}, nil
+	}
 	return "# GVS 全局代码理解\n\n## 模块\n- qatool：质量检测工具。", llm.Usage{TotalTokens: 20}, nil
 }
 

@@ -30,6 +30,7 @@ import (
 	"gvs-pr-agent/internal/locator"
 	"gvs-pr-agent/internal/notifier"
 	"gvs-pr-agent/internal/packager"
+	"gvs-pr-agent/internal/progress"
 	"gvs-pr-agent/internal/reflector"
 	"gvs-pr-agent/internal/rules"
 	"gvs-pr-agent/internal/state"
@@ -337,6 +338,7 @@ func (s *Service) reviewPRSnapshot(ctx context.Context, repo config.RepoConfig, 
 // 筛选后无文件时返回 (nil, nil)。
 func (s *Service) reviewDiff(ctx context.Context, rawDiff, repoFullName, title, body string,
 	log *slog.Logger) (*coordinator.Summary, error) {
+	progress.Stage(ctx, "preparing", repoFullName, title)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -401,6 +403,7 @@ func (s *Service) reviewDiff(ctx context.Context, rawDiff, repoFullName, title, 
 	if s.analyzer != nil {
 		var globalDocument string
 		if s.knowledge != nil {
+			progress.Stage(ctx, "understanding", "", "")
 			snapshot, usage, prepareErr := s.prepareKnowledge(ctx, model)
 			knowledgeUsage = usage
 			if prepareErr != nil {
@@ -425,6 +428,7 @@ func (s *Service) reviewDiff(ctx context.Context, rawDiff, repoFullName, title, 
 			}
 		}
 		var analyzeErr error
+		progress.Stage(ctx, "analysis", "", "")
 		analysisInput := analyzer.Input{
 			Repository: repoFullName, Title: title, Body: body,
 			Diff: analysisDiff(files, 0), GlobalUnderstanding: globalDocument, Model: model,
@@ -453,6 +457,7 @@ func (s *Service) reviewDiff(ctx context.Context, rawDiff, repoFullName, title, 
 
 	// 多 Agent 并行审查（按包 × 角色分发）+ 定位 + 反思去重
 	doc := s.reviewRules(ctx)
+	progress.Stage(ctx, "reviewing/confirming", "", "")
 	summary := s.coord.Run(ctx, base, pkgs, func(role string, pkgFiles []*diff.FileDiff) []string {
 		return doc.ForAgent(role, pkgFiles)
 	}, files, coordinator.Options{
@@ -741,8 +746,8 @@ func (s *Service) reviewCodeupMRs(ctx context.Context, repo config.CodeupRepoCon
 	return nil
 }
 
-// reviewChangeRequest 审查单个合并请求：以合并源最新版本的 CommitID 作去重基线，
-// diff 取 目标分支..源分支（Merge-Base），结果发布为 MR 全局评论。
+// reviewChangeRequest deduplicates code snapshots, independent of MR wording.
+// Subsequent source versions use the last successful source as their diff base.
 func (s *Service) reviewChangeRequest(ctx context.Context, repo config.CodeupRepoConfig,
 	mr *codeup.ChangeRequest) error {
 	key := fmt.Sprintf("mr:%s:%d", repo.RepositoryID, mr.LocalID)
@@ -760,7 +765,7 @@ func (s *Service) reviewChangeRequest(ctx context.Context, repo config.CodeupRep
 		if err != nil {
 			return err
 		}
-		version = source.CommitID + ":" + target + ":" + fingerprint([]string{mr.Title, mr.Description})
+		version = source.CommitID + ":" + target
 	}
 	// Claim the MR before fetching patch sets. Completed versions are deduplicated
 	// by the persistent baseline inside reviewChangeRequestSnapshot.
@@ -800,27 +805,44 @@ func (s *Service) reviewChangeRequestSnapshot(ctx context.Context, repo config.C
 	if err != nil {
 		return err
 	}
-	inputSignature := fingerprint([]string{s.signature(s.reviewRules(ctx)), mr.Title, mr.Description})
-	if s.branchSt.MatchesReview(key, src.CommitID, targetSHA, inputSignature) {
+	previousSHA, previousTarget := s.branchSt.GetVersion(key)
+	// Existing successful snapshots also migrate without repeating their review
+	// merely because older input hashes included the title and description.
+	if previousSHA == src.CommitID && previousTarget == targetSHA {
 		return nil
 	}
 	if src.CommitID == "" || src.PatchSetBizID == "" {
 		return fmt.Errorf("MR 源版本缺少提交 SHA 或版本 ID")
 	}
-	rawDiff, _, err := s.cu.GetCompareDiff(ctx, repo.RepositoryID, targetSHA, src.CommitID)
+	fromSHA := targetSHA
+	incremental := previousSHA != "" && previousTarget == targetSHA
+	var rawDiff string
+	if incremental {
+		fromSHA = previousSHA
+		rawDiff, _, err = s.cu.GetVersionDiff(ctx, repo.RepositoryID, fromSHA, src.CommitID)
+	} else {
+		rawDiff, _, err = s.cu.GetCompareDiff(ctx, repo.RepositoryID, fromSHA, src.CommitID)
+	}
 	if err != nil {
 		return err
 	}
+	inputSignature := fingerprint([]string{s.signature(s.reviewRules(ctx)), "mr-code-delta-v1", fromSHA, src.CommitID, targetSHA})
+	reviewScope := fmt.Sprintf("首次/目标基线变化后的完整 MR 审核：`%s...%s`", targetSHA, src.CommitID)
+	if incremental {
+		reviewScope = fmt.Sprintf("增量审核：上次成功版本 `%s` → 当前版本 `%s`；本报告仅覆盖这两个代码版本之间的差异", fromSHA, src.CommitID)
+	}
+	log.Info("MR 审核范围", "incremental", incremental, "from_sha", fromSHA, "to_sha", src.CommitID, "target_sha", targetSHA)
 
 	title := fmt.Sprintf("MR !%d %s（%s -> %s）", mr.LocalID, mr.Title, mr.SourceBranch, mr.TargetBranch)
-	scope := fmt.Sprintf("%s!%d:%s:%s", repo.RepositoryID, mr.LocalID, src.CommitID, targetSHA)
+	scope := fmt.Sprintf("mr-code-delta-v1:%s!%d:%s:%s:%s:%s", repo.RepositoryID, mr.LocalID, fromSHA, src.CommitID, targetSHA, fingerprint(rawDiff))
 	ctx = s.checkpointContext(ctx, scope)
-	summary, err := s.reviewDiff(ctx, rawDiff, name, title, mr.Description, log)
+	reviewBody := reviewScope + "\n仅审查本次提供的代码差异；MR 标题和描述是背景材料，不代表本次新增变更。\n\n" + mr.Description
+	summary, err := s.reviewDiff(ctx, rawDiff, name, title, reviewBody, log)
 	if err != nil {
 		return err
 	}
-	if summary == nil && ctx.Value(focusedMRKey{}) == true {
-		return fmt.Errorf("MR 无有效的待审查文件（diff 为空或被路径规则筛除）")
+	if summary == nil && strings.TrimSpace(rawDiff) != "" && ctx.Value(focusedMRKey{}) == true {
+		return fmt.Errorf("MR 无有效的待审查文件（变更被路径规则筛除）")
 	}
 	// The diff and comment version must remain the captured immutable snapshot.
 	fresh, err := s.cu.ListPatchSets(ctx, repo.RepositoryID, mr.LocalID)
@@ -832,7 +854,7 @@ func (s *Service) reviewChangeRequestSnapshot(ctx context.Context, repo config.C
 	if err != nil {
 		return err
 	}
-	if current == nil || current.CommitID != src.CommitID || current.PatchSetBizID != src.PatchSetBizID || freshTarget != targetSHA {
+	if current == nil || current.CommitID != src.CommitID || current.PatchSetBizID == "" || freshTarget != targetSHA {
 		return fmt.Errorf("MR 版本在审查期间发生变化，放弃发布及基线推进")
 	}
 	open, err := s.cu.ListOpenChangeRequests(ctx, repo.RepositoryID)
@@ -841,17 +863,19 @@ func (s *Service) reviewChangeRequestSnapshot(ctx context.Context, repo config.C
 	}
 	stillCurrent := false
 	for _, item := range open {
-		if item.LocalID == mr.LocalID && item.State != "CLOSED" && item.State != "MERGED" && item.Title == mr.Title && item.Description == mr.Description && item.SourceBranch == mr.SourceBranch && item.TargetBranch == mr.TargetBranch && !item.IsWIP() && !item.HasConflict() {
+		if item.LocalID == mr.LocalID && item.State != "CLOSED" && item.State != "MERGED" && item.SourceBranch == mr.SourceBranch && item.TargetBranch == mr.TargetBranch && !item.IsWIP() && !item.HasConflict() {
 			stillCurrent = true
 			break
 		}
 	}
 	if !stillCurrent {
-		return fmt.Errorf("MR 已关闭或元数据发生变化，放弃发布及基线推进")
+		return fmt.Errorf("MR 已关闭、分支或可审核状态发生变化，放弃发布及基线推进")
 	}
 	if summary == nil {
+		log.Info("MR 无新增可审核代码，不调用模型或发布报告", "from_sha", fromSHA, "to_sha", src.CommitID)
 		return s.branchSt.SetReview(key, src.CommitID, targetSHA, inputSignature)
 	}
+	summary.VerificationOverview = reviewScope + "\n\n" + summary.VerificationOverview
 
 	body := notifier.BuildComment(*summary, notifier.Options{
 		MentionAuthor:    s.cfg.Notification.MentionAuthor,
@@ -869,7 +893,7 @@ func (s *Service) reviewChangeRequestSnapshot(ctx context.Context, repo config.C
 	}
 	publicationID := fmt.Sprintf("mr:%s:%d:%s:%s:%s", repo.RepositoryID, mr.LocalID, src.CommitID, targetSHA, inputSignature)
 	if err := s.publishOnce(ctx, publicationID, body, func() error {
-		return s.cu.CreateChangeRequestComment(ctx, repo.RepositoryID, mr.LocalID, src.PatchSetBizID, body)
+		return s.cu.CreateChangeRequestComment(ctx, repo.RepositoryID, mr.LocalID, current.PatchSetBizID, body)
 	}); err != nil {
 		return err
 	}

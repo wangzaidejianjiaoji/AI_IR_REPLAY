@@ -27,6 +27,7 @@ import (
 	"gvs-pr-agent/internal/instance"
 	"gvs-pr-agent/internal/lifecycle"
 	"gvs-pr-agent/internal/logger"
+	"gvs-pr-agent/internal/progress"
 	"gvs-pr-agent/internal/review"
 	"gvs-pr-agent/internal/scheduler"
 )
@@ -146,6 +147,10 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	statusName := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(*configPath), "config-"), filepath.Ext(*configPath))
+	tracker := progress.New(filepath.Join("data", "runtime", statusName+".status.json"), log)
+	ctx = progress.WithTracker(ctx, tracker)
+	defer tracker.Run(ctx, 15*time.Second)()
 
 	// 规则文档热更新（rules.hot_reload 开启时生效）
 	svc.StartRuleHotReload(ctx.Done())

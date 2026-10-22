@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"gvs-pr-agent/internal/config"
+	"gvs-pr-agent/internal/progress"
 )
 
 // Client kimi API 客户端。
@@ -122,6 +123,7 @@ func (c *Client) Chat(ctx context.Context, model string, messages []Message) (st
 	}
 	path, key := c.checkpointPath(ctx, model, messages)
 	if saved, ok := readResponse(path, key); ok {
+		progress.Cached(ctx)
 		c.logger.Info("复用已保存模型结果", "model", model, "checkpoint", key)
 		// Replayed work incurs no new HTTP attempt or round token reservation.
 		return saved.Content, Usage{}, nil
@@ -234,6 +236,13 @@ func (c *Client) chatOnce(ctx context.Context, model string, messages []Message)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.cfg.APIKey)
 
+	progress.Attempt(ctx)
+	usageRecorded := false
+	defer func() {
+		if !usageRecorded {
+			progress.Usage(ctx, 0, 0, 0, false)
+		}
+	}()
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return "", Usage{}, true, fmt.Errorf("llm request: %w", err)
@@ -261,6 +270,12 @@ func (c *Client) chatOnce(ctx context.Context, model string, messages []Message)
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return "", Usage{}, false, fmt.Errorf("parse llm response: %w", err)
 	}
+	var envelope struct {
+		Usage *json.RawMessage `json:"usage"`
+	}
+	_ = json.Unmarshal(body, &envelope)
+	progress.Usage(ctx, parsed.Usage.PromptTokens, parsed.Usage.CompletionTokens, parsed.Usage.TotalTokens, envelope.Usage != nil)
+	usageRecorded = true
 	if parsed.Error != nil {
 		return "", Usage{}, false, fmt.Errorf("llm error: %s", c.redact(parsed.Error.Message))
 	}

@@ -16,6 +16,7 @@ import (
 	"gvs-pr-agent/internal/llm"
 	"gvs-pr-agent/internal/locator"
 	"gvs-pr-agent/internal/packager"
+	"gvs-pr-agent/internal/progress"
 	"gvs-pr-agent/internal/reflector"
 	"gvs-pr-agent/internal/textbudget"
 )
@@ -144,7 +145,9 @@ func (c *Coordinator) Run(ctx context.Context, base agent.Task, pkgs []packager.
 				t.Rules = rulesFor(a.Role(), j.pkg.Files)
 
 				c.logger.Info("agent 开始审查", "agent", a.Role(), "package", j.pkg.Name, "model", t.Model)
+				finishJob := progress.Job(ctx, a.Role()+":"+j.pkg.Name)
 				r := a.Review(ctx, t)
+				finishJob()
 				c.logger.Info("agent 审查完成", "agent", a.Role(), "package", j.pkg.Name,
 					"issues", len(r.Issues), "tokens", r.Usage.TotalTokens, "error", errString(r.Err))
 
@@ -163,6 +166,7 @@ func (c *Coordinator) Run(ctx context.Context, base agent.Task, pkgs []packager.
 		}
 	}
 	if c.confirmer != nil && !sum.AllFailed && sum.FailedJobs == 0 && len(sum.TruncatedPackages) == 0 {
+		progress.Stage(ctx, "confirming", "", "")
 		var fullDiff strings.Builder
 		for _, file := range files {
 			fullDiff.WriteString(file.Patch)

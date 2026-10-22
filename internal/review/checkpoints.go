@@ -31,7 +31,7 @@ func (s *Service) signature(doc *rules.Document) string {
 		Agents        any
 		Review        any
 		Model         any
-	}{2, doc, s.cfg.Understanding, s.cfg.Agents, s.cfg.Review, s.cfg.LLM})
+	}{3, doc, s.cfg.Understanding, s.cfg.Agents, s.cfg.Review, s.cfg.LLM})
 }
 
 func (s *Service) checkpointContext(ctx context.Context, identity string) context.Context {

@@ -157,7 +157,7 @@ func TestFocusedMRNewVersionInSameService(t *testing.T) {
 	}
 }
 
-func TestMRMetadataOnlyChangeIsReviewed(t *testing.T) {
+func TestMRMetadataOnlyChangeDoesNotReviewAgain(t *testing.T) {
 	cu, cfg, _ := focusedFixture(t)
 	model, calls := newMockLLM(t)
 	cfg.LLM.BaseURL = model.URL
@@ -166,12 +166,14 @@ func TestMRMetadataOnlyChangeIsReviewed(t *testing.T) {
 	}
 	cu.mu.Lock()
 	cu.mrs[1]["description"] = "new requirement"
+	cu.mrs[1]["title"] = "updated wording"
+	cu.patchSets[0]["patchSetBizId"] = "same-code-new-version-label"
 	cu.mu.Unlock()
 	if err := focusedCall(t, newTestService(t, cfg), "lzvsg/gvs", 8); err != nil {
 		t.Fatal(err)
 	}
-	if *calls != 2 {
-		t.Fatalf("metadata changed but baseline matched: %d", *calls)
+	if *calls != 1 {
+		t.Fatalf("metadata-only change invoked model again: %d", *calls)
 	}
 }
 
@@ -221,7 +223,8 @@ func TestQueuedSnapshotChangePreventsStaleClosure(t *testing.T) {
 		{key: "first", version: "v1", execute: func(ctx context.Context) error { return s.queue().register(ctx, "second", "new-version") }},
 		{key: "second", version: "old-version", execute: func(context.Context) error { ranStale = true; return nil }},
 	}
-	if err := s.executeCollected(ctx, candidates); err == nil {
+	executionErr := s.executeCollected(ctx, candidates)
+	if executionErr == nil {
 		t.Fatal("stale queue closure accepted")
 	}
 	if ranStale {
@@ -229,6 +232,6 @@ func TestQueuedSnapshotChangePreventsStaleClosure(t *testing.T) {
 	}
 	job, err := s.queue().load("second")
 	if err != nil || job.Version != "new-version" || job.State == "completed" {
-		t.Fatalf("new version marked complete: %+v %v", job, err)
+		t.Fatalf("new version lost or marked complete: %+v load=%v execution=%v", job, err, executionErr)
 	}
 }

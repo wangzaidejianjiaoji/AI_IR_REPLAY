@@ -97,9 +97,6 @@ func (m *Manager) Prepare(ctx context.Context, modelName string) (Snapshot, llm.
 		if err != nil {
 			return fallback, llm.Usage{}, fmt.Errorf("获取理解增量 %s..%s: %w", short(previous), short(head), err)
 		}
-		if len(doc) > 60000 || len(delta) > 90000 {
-			return fallback, llm.Usage{}, fmt.Errorf("理解更新输入超出预算，保留旧版本，不标记新 SHA")
-		}
 	} else {
 		reader := m.readSnapshot
 		if reader == nil {
@@ -110,10 +107,22 @@ func (m *Manager) Prepare(ctx context.Context, modelName string) (Snapshot, llm.
 			return fallback, llm.Usage{}, fmt.Errorf("初始化需要版本化源码快照: %w", err)
 		}
 	}
-	updated, usage, err := m.updateDocument(ctx, modelName, doc, delta)
+	var updated string
+	var usage llm.Usage
+	if previous != "" {
+		updated, usage, err = m.updateIncrementally(ctx, modelName, doc, delta, previous, head)
+	} else {
+		updated, usage, err = m.updateDocument(ctx, modelName, doc, delta)
+	}
 	if err != nil {
 		return fallback, usage, err
 	}
+	if err := ctx.Err(); err != nil {
+		return fallback, usage, err
+	}
+	// Version metadata is owned by the manager, never copied from model output.
+	updated = sourceRepositoryRe.ReplaceAllString(updated, "")
+	updated = sourceSHARe.ReplaceAllString(updated, "")
 	updated = fmt.Sprintf("<!-- SOURCE-REPOSITORY: %s -->\n<!-- SOURCE-SHA: %s -->\n\n%s",
 		m.cfg.SourceRepository, head, strings.TrimSpace(updated))
 	if err := writeDocument(m.cfg.DocumentPath, updated); err != nil {
