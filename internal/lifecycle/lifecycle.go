@@ -134,6 +134,10 @@ func Run(root, action, name string, output io.Writer) error {
 			}
 			if len(found) == 0 {
 				fmt.Fprintf(output, "%s: stopped\n", instance)
+				// 实例已停止：仍罗列该实例的审核历史（无历史时不输出）。
+				if err := progress.Print(filepath.Join(root, "data", "runtime", instance+".status.json"), 0, output); err != nil {
+					fmt.Fprintf(output, "  review status unavailable: %v\n", err)
+				}
 				continue
 			}
 			fmt.Fprintf(output, "%s:", instance)

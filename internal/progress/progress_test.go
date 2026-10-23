@@ -43,26 +43,60 @@ func TestStatusPersistsActiveReviewUsageAndTerminalFailure(t *testing.T) {
 	if got.Task != "codeup:infer:7" || got.Stage != "understanding" || got.TotalTokens != 100 || got.PromptTokens != 70 || got.CompletionTokens != 30 || got.CacheHits != 1 || got.StartedAt.IsZero() || got.PID != os.Getpid() || len(got.ActiveJobs) != 1 || got.ActiveJobs[0] != "security:streamer" {
 		t.Fatalf("status=%+v", got)
 	}
-	endSecurity()
-	finish("interrupted")
-	tracker.Publish()
+	// 进行中的审核：当前行带表头展示，历史为空时不输出历史行。
+	logs.Reset()
 	if err := Print(path, os.Getpid(), &logs); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(logs.String(), "interrupted") || !strings.Contains(logs.String(), "Update streaming lifetime") || !strings.Contains(logs.String(), "100") {
-		t.Fatal(logs.String())
+	for _, want := range []string{"审核对象", "运行中的角色/包", "codeup:infer:7 Update streaming lifetime", "understanding", "security:streamer", "100 (70+30)"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Fatalf("live row missing %q:\n%s", want, logs.String())
+		}
 	}
+	endSecurity()
+	finish("interrupted")
+	tracker.Publish()
+	// 已结束：当前行不再展示，历史行记录结果与用量。
+	logs.Reset()
+	if err := Print(path, os.Getpid(), &logs); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"审核对象", "中断·understanding", "codeup:infer:7 Update streaming lifetime", "100 (70+30)"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Fatalf("history row missing %q:\n%s", want, logs.String())
+		}
+	}
+	// 状态文件不属于发现进程：仍罗列历史，不展示当前行。
 	logs.Reset()
 	if err := Print(path, os.Getpid()+1, &logs); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(logs.String(), "stale") {
-		t.Fatal("stale process state presented as live")
+	if !strings.Contains(logs.String(), "中断·understanding") {
+		t.Fatal("history not listed for mismatched pid")
+	}
+	// 状态文件声称审核中但无法核实归属：提示 stale 且不展示当前行。
+	stale, err := json.Marshal(Snapshot{PID: os.Getpid() + 1, State: "reviewing", Task: "codeup:infer:9", Stage: "analysis", StartedAt: time.Now(), UpdatedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, stale, 0600); err != nil {
+		t.Fatal(err)
+	}
+	logs.Reset()
+	if err := Print(path, os.Getpid(), &logs); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs.String(), "stale") || strings.Contains(logs.String(), "codeup:infer:9") {
+		t.Fatalf("stale state presented as live:\n%s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "中断·understanding") {
+		t.Fatalf("history missing alongside stale note:\n%s", logs.String())
 	}
 }
 
 func TestOldAttemptCannotMutateNextReview(t *testing.T) {
-	tracker := New(filepath.Join(t.TempDir(), "status.json"), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	statusPath := filepath.Join(t.TempDir(), "status.json")
+	tracker := New(statusPath, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	ctx := WithTracker(context.Background(), tracker)
 	endOld := Begin(ctx, "old", "v1")
 	oldCtx := ReviewContext(ctx)
@@ -76,4 +110,8 @@ func TestOldAttemptCannotMutateNextReview(t *testing.T) {
 	finish("completed")
 	stop := tracker.Run(context.Background(), time.Millisecond)
 	stop()
+	history := readHistory(historyPathFor(statusPath))
+	if len(history) != 2 || history[0].Task != "old" || history[1].Task != "new" || history[1].TotalTokens != 0 || history[1].State != "completed" {
+		t.Fatalf("history=%+v", history)
+	}
 }
