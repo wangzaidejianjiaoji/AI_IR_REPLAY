@@ -50,7 +50,6 @@ review:
   dry_run: true
   max_diff_chars: 60000
   max_agent_concurrency: 4
-  max_files_per_review: 20
   file_packaging:
     enabled: true
     max_package_size: 5

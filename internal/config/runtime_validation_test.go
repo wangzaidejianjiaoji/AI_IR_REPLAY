@@ -7,7 +7,7 @@ func TestRejectMalformedRuntimeConfiguration(t *testing.T) {
 		"scheduler: {interval: '-1s'}", "scheduler: {interval: '0s'}", "scheduler: {jitter: '-1s'}",
 		"scheduler: {interval: 'invalid'}", "agents: {made_up: {enabled: true}}",
 		"llm: {models: {small: 'm', medium: '', large: 'm'}}",
-		"review: {max_agent_concurrency: -1}", "review: {max_files_per_review: -1}",
+		"review: {max_agent_concurrency: -1}",
 		"llm: {timeout: '0s'}", "review: {max_llm_calls: -1}",
 		"review: {round_timeout: 'bad'}", "review: {max_round_tokens: -1}",
 		"review: {active_hours: {start: '25:00', end: '21:00'}}",

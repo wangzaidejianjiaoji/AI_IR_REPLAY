@@ -22,7 +22,6 @@ func TestMRSeventyFiveFilesPublishesCompleteReport(t *testing.T) {
 	}))
 	defer model.Close()
 	cfg := testConfig(t, cu.srv.URL, model.URL)
-	cfg.Review.MaxFilesPerReview = 100
 	cfg.Review.FilePackaging.Enabled = true
 	cfg.Review.FilePackaging.MaxPackageSize = 5
 	cfg.Codeup.MRReview, cfg.Codeup.MRComment = true, true
@@ -140,7 +139,6 @@ func TestLargeGlobalAnalysisReadsEveryPackageAndSharesMergedIntent(t *testing.T)
 	}))
 	defer model.Close()
 	cfg := testConfig(t, "http://127.0.0.1:1", model.URL)
-	cfg.Review.MaxFilesPerReview = 100
 	cfg.Review.MaxDiffChars = 1000
 	cfg.Review.FilePackaging.Enabled = true
 	cfg.Review.FilePackaging.MaxPackageSize = 5

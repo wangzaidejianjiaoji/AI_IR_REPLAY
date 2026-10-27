@@ -210,7 +210,6 @@ func testConfig(t *testing.T, codeupURL, llmURL string) *config.Config {
 	cfg.Agents = map[string]config.Agent{"security": {Enabled: true, Priority: 1}}
 	cfg.Review.MaxDiffChars = 60000
 	cfg.Review.MaxAgentConcurrency = 1
-	cfg.Review.MaxFilesPerReview = 20
 	cfg.Notification.MaxIssuesDisplay = 10
 	cfg.Notification.MentionAuthor = true
 	cfg.Codeup = config.CodeupConfig{
@@ -221,6 +220,8 @@ func testConfig(t *testing.T, codeupURL, llmURL string) *config.Config {
 		PerPage:        100,
 		StatePath:      filepath.Join(t.TempDir(), "branch-state.json"),
 		CommitComment:  true,
+		// 分支推送审查特性测试默认开启；调度默认（未显式开启）仅审查不在开发中的 MR。
+		BranchReview: true,
 		Repos: []config.CodeupRepoConfig{{
 			RepositoryID: "lzvsg/gvs",
 			Name:         "lzvsg/gvs",
@@ -470,6 +471,57 @@ func TestMRReviewFlow(t *testing.T) {
 	}
 }
 
+// TestScheduledReviewOnlyTargetsReadyMRs 验证默认调度行为（branch_review 未开启）：
+// 只审查不在开发中的 MR——UNDER_DEV 跳过、分支推送不审查；提交评审后自动进入审查。
+func TestScheduledReviewOnlyTargetsReadyMRs(t *testing.T) {
+	cu := newMockCodeup(t)
+	llmSrv, llmCalls := newMockLLM(t)
+	cfg := testConfig(t, cu.srv.URL, llmSrv.URL)
+	cfg.Codeup.MRReview = true
+	cfg.Codeup.MRComment = true
+	cfg.Codeup.BranchReview = false
+	svc := newTestService(t, cfg)
+	ctx := context.Background()
+
+	cu.setBranches(branch("master", "sha-m", true), branch("dev-branch", "sha-1", false))
+	cu.mu.Lock()
+	cu.mrs = []map[string]any{
+		{
+			"localId": 8, "title": "feat: 开发中", "state": "UNDER_DEV",
+			"sourceBranch": "dev-branch", "targetBranch": "master",
+			"author": map[string]any{"name": "张腾予", "username": "zhangty"},
+		},
+	}
+	cu.patchSets = []map[string]any{
+		{"patchSetBizId": "ps-t", "commitId": "sha-m", "versionNo": 1, "relatedMergeItemType": "MERGE_TARGET"},
+		{"patchSetBizId": "ps-1", "commitId": "mr-sha-1", "versionNo": 1, "relatedMergeItemType": "MERGE_SOURCE"},
+	}
+	cu.mu.Unlock()
+
+	// 轮次 1：MR 开发中 + 分支推送均不触发审查
+	svc.RunOnce(ctx)
+	compares, commitComments, mrComments := cu.snapshot()
+	if len(compares) != 0 || len(commitComments) != 0 || len(mrComments[8]) != 0 {
+		t.Fatalf("开发中 MR 与分支推送都不应审查: compares=%v commits=%v mr=%v", compares, commitComments, mrComments)
+	}
+	if *llmCalls != 0 {
+		t.Fatalf("不应调用 LLM: calls=%d", *llmCalls)
+	}
+
+	// 轮次 2：MR 提交评审（UNDER_REVIEW）后自动进入审查
+	cu.mu.Lock()
+	cu.mrs[0]["state"] = "UNDER_REVIEW"
+	cu.mu.Unlock()
+	svc.RunOnce(ctx)
+	compares, _, mrComments = cu.snapshot()
+	if len(compares) != 1 || compares[0] != "sha-m..mr-sha-1" {
+		t.Fatalf("提交评审后应审查 MR: compares=%v", compares)
+	}
+	if len(mrComments[8]) != 1 {
+		t.Fatalf("应发布 MR 评论: %v", mrComments)
+	}
+}
+
 // TestAllAgentsFailedNoPublish 验收标准 4/6 补强（源自真实演练缺陷）：
 // LLM 全部失败（如 401）时不得发布"审查通过"空报告，且去重基线不推进。
 func TestAllAgentsFailedNoPublish(t *testing.T) {
@@ -498,79 +550,49 @@ func TestAllAgentsFailedNoPublish(t *testing.T) {
 	}
 }
 
-// TestBranchPushRejectsIncompleteCoverage 覆盖率拦截（分支推送路径）：
-// 筛选后文件数超过 max_files_per_review 时审查必须失败——不发评论、不推进基线、不调用 LLM。
-func TestBranchPushRejectsIncompleteCoverage(t *testing.T) {
+// TestExecutionLockSerializesInstances 验证共享 runtime_dir 的实例串行审核：
+// 执行锁被持有时本轮不领取任务、不调用模型，释放后下一轮恢复审查。
+func TestExecutionLockSerializesInstances(t *testing.T) {
 	cu := newMockCodeup(t)
 	llmSrv, llmCalls := newMockLLM(t)
 	cfg := testConfig(t, cu.srv.URL, llmSrv.URL)
-	cfg.Review.MaxFilesPerReview = 1
-	svc := newTestService(t, cfg)
-	ctx := context.Background()
-	stateKey := "lzvsg/gvs:qatool-zhangty"
-
-	cu.setBranches(branch("qatool-zhangty", "sha-1", false))
-	svc.RunOnce(ctx) // 首次记录基线
-
-	// 推送 sha-2：compare 返回 2 个文件，超出上限 1
-	cu.setCompareDiffs(
-		map[string]any{"oldPath": "gvs/a.go", "newPath": "gvs/a.go", "diff": fileDiff("gvs/a.go")},
-		map[string]any{"oldPath": "gvs/b.go", "newPath": "gvs/b.go", "diff": fileDiff("gvs/b.go")},
-	)
-	cu.setBranches(branch("qatool-zhangty", "sha-2", false))
-	svc.RunOnce(ctx)
-
-	_, comments, _ := cu.snapshot()
-	if len(comments) != 0 {
-		t.Fatalf("覆盖不完整时不应发布评论: %v", comments)
-	}
-	if got := baseline(t, cfg.Codeup.StatePath, stateKey); got != "sha-1" {
-		t.Fatalf("覆盖不完整时基线 = %q, want sha-1（不推进，下轮重试）", got)
-	}
-	if *llmCalls != 0 {
-		t.Fatalf("覆盖不完整时不应调用 LLM（避免把部分覆盖当完整结论）, calls=%d", *llmCalls)
-	}
-}
-
-// TestMRReviewRejectsIncompleteCoverage 覆盖率拦截（MR 路径）：
-// 文件数超限时不得发布 MR 评论、不得推进 MR 去重基线。
-func TestMRReviewRejectsIncompleteCoverage(t *testing.T) {
-	cu := newMockCodeup(t)
-	llmSrv, llmCalls := newMockLLM(t)
-	cfg := testConfig(t, cu.srv.URL, llmSrv.URL)
-	cfg.Review.MaxFilesPerReview = 1
 	cfg.Codeup.MRReview = true
 	cfg.Codeup.MRComment = true
 	svc := newTestService(t, cfg)
-	ctx := context.Background()
 
-	cu.setBranches(branch("master", "sha-m", true)) // 无待审分支，聚焦 MR
+	cu.setBranches(branch("master", "sha-m", true))
 	cu.mu.Lock()
 	cu.mrs = []map[string]any{{
-		"localId": 8, "title": "feat: big change", "state": "UNDER_REVIEW",
-		"sourceBranch": "feature-big", "targetBranch": "master",
+		"localId": 8, "title": "feat", "state": "UNDER_REVIEW",
+		"sourceBranch": "feature", "targetBranch": "master",
 		"author": map[string]any{"name": "张腾予", "username": "zhangty"},
 	}}
 	cu.patchSets = []map[string]any{
+		{"patchSetBizId": "ps-t", "commitId": "sha-m", "versionNo": 1, "relatedMergeItemType": "MERGE_TARGET"},
 		{"patchSetBizId": "ps-1", "commitId": "mr-sha-1", "versionNo": 1, "relatedMergeItemType": "MERGE_SOURCE"},
 	}
 	cu.mu.Unlock()
-	cu.setCompareDiffs(
-		map[string]any{"oldPath": "gvs/a.go", "newPath": "gvs/a.go", "diff": fileDiff("gvs/a.go")},
-		map[string]any{"oldPath": "gvs/b.go", "newPath": "gvs/b.go", "diff": fileDiff("gvs/b.go")},
-	)
 
-	svc.RunOnce(ctx)
-
-	_, _, mrComments := cu.snapshot()
-	if len(mrComments[8]) != 0 {
-		t.Fatalf("覆盖不完整时不应发布 MR 评论: %v", mrComments)
+	// 另一个实例持有共享执行锁：本轮必须完全让位
+	release, err := acquireExecution(cfg.Review.RuntimeDir)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := baseline(t, cfg.Codeup.StatePath, "mr:lzvsg/gvs:8"); got != "" {
-		t.Fatalf("覆盖不完整时 MR 基线 = %q, want 空（不推进，拆分后重审）", got)
+	svc.RunOnce(context.Background())
+	compares, commitComments, mrComments := cu.snapshot()
+	if len(compares) != 0 || len(commitComments) != 0 || len(mrComments[8]) != 0 {
+		t.Fatalf("执行锁被持有时不应审查: compares=%v commits=%v mr=%v", compares, commitComments, mrComments)
 	}
 	if *llmCalls != 0 {
-		t.Fatalf("覆盖不完整时不应调用 LLM, calls=%d", *llmCalls)
+		t.Fatalf("执行锁被持有时不应调用 LLM: calls=%d", *llmCalls)
+	}
+
+	// 释放后下一轮正常审查
+	release()
+	svc.RunOnce(context.Background())
+	compares, _, mrComments = cu.snapshot()
+	if len(compares) != 1 || compares[0] != "sha-m..mr-sha-1" || len(mrComments[8]) != 1 {
+		t.Fatalf("释放执行锁后应恢复审查: compares=%v mr=%v", compares, mrComments)
 	}
 }
 
@@ -587,20 +609,6 @@ func TestLocalDiffRegression(t *testing.T) {
 	}
 	if !strings.Contains(report, "硬编码密钥") {
 		t.Errorf("本地审查报告不含预期问题:\n%s", report)
-	}
-}
-
-func TestLocalDiffRejectsIncompleteCoverage(t *testing.T) {
-	llmSrv, _ := newMockLLM(t)
-	cfg := testConfig(t, "http://127.0.0.1:1", llmSrv.URL)
-	cfg.Review.MaxFilesPerReview = 1
-	svc := newTestService(t, cfg)
-
-	rawDiff := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1 @@\n-old-a\n+new-a\n" +
-		"diff --git a/b.go b/b.go\n--- a/b.go\n+++ b/b.go\n@@ -1 +1 @@\n-old-b\n+new-b\n"
-	_, err := svc.ReviewLocalDiff(context.Background(), rawDiff, "超限变更")
-	if err == nil || !strings.Contains(err.Error(), "审查覆盖不完整") {
-		t.Fatalf("超出文件上限时应拒绝部分评审，err=%v", err)
 	}
 }
 

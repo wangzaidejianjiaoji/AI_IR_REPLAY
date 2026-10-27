@@ -104,7 +104,7 @@ func TestFocusedMRSelectsExactConfiguredMR(t *testing.T) {
 }
 
 func TestFocusedMRFailuresDoNotAdvanceOrPublish(t *testing.T) {
-	for _, name := range []string{"unknown-repository", "duplicate-repository", "invalid-id", "missing", "wip", "conflict", "closed", "missing-source", "invalid-source", "filtered", "coverage", "disabled"} {
+	for _, name := range []string{"unknown-repository", "duplicate-repository", "invalid-id", "missing", "wip", "under-dev", "conflict", "closed", "missing-source", "invalid-source", "filtered", "disabled"} {
 		t.Run(name, func(t *testing.T) {
 			cu, cfg, svc := focusedFixture(t)
 			repository, id := "lzvsg/gvs", 8
@@ -119,6 +119,8 @@ func TestFocusedMRFailuresDoNotAdvanceOrPublish(t *testing.T) {
 				id = 77
 			case "wip":
 				cu.mrs[1]["title"] = "WIP: fix"
+			case "under-dev":
+				cu.mrs[1]["state"] = "UNDER_DEV"
 			case "conflict":
 				cu.mrs[1]["mergeStatus"] = "conflict"
 			case "closed":
@@ -129,9 +131,6 @@ func TestFocusedMRFailuresDoNotAdvanceOrPublish(t *testing.T) {
 				cu.patchSets[0]["commitId"] = ""
 			case "filtered":
 				cfg.Review.IncludePaths = []string{"missing/**"}
-			case "coverage":
-				cfg.Review.MaxFilesPerReview = 1
-				cu.setCompareDiffs(map[string]any{"oldPath": "a.go", "newPath": "a.go", "diff": fileDiff("a.go")}, map[string]any{"oldPath": "b.go", "newPath": "b.go", "diff": fileDiff("b.go")})
 			case "disabled":
 				cfg.Codeup.MRReview = false
 			}

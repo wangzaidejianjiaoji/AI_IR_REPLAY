@@ -80,6 +80,7 @@ type CodeupConfig struct {
 	PerPage         int                `yaml:"per_page"`          // 分支列表每页数量
 	StatePath       string             `yaml:"state_path"`        // 分支基线存储文件（默认 ./data/branch-state.json）
 	ReviewFirstPush bool               `yaml:"review_first_push"` // 首次发现分支时是否对比基准分支做全量审查（默认仅记录基线）
+	BranchReview    bool               `yaml:"branch_review"`     // 是否审查分支推送（默认关闭：分支处于开发中，仅审查不在开发中的 MR）
 	CommitComment   bool               `yaml:"commit_comment"`    // 是否将审查结果回写为 commit 评论
 	MRReview        bool               `yaml:"mr_review"`         // 是否审查 Codeup 合并请求（新版 MR）
 	MRComment       bool               `yaml:"mr_comment"`        // 是否将审查结果回写为 MR 全局评论
@@ -184,7 +185,6 @@ type ReviewConfig struct {
 	DryRun              bool     `yaml:"dry_run"`
 	MaxDiffChars        int      `yaml:"max_diff_chars"`
 	MaxAgentConcurrency int      `yaml:"max_agent_concurrency"`
-	MaxFilesPerReview   int      `yaml:"max_files_per_review"`
 	IncludePaths        []string `yaml:"include_paths"`
 	ExcludePaths        []string `yaml:"exclude_paths"`
 	MaxLLMCalls         int      `yaml:"max_llm_calls"`
@@ -375,9 +375,6 @@ func (c *Config) applyDefaults() {
 	if c.Review.MaxAgentConcurrency <= 0 {
 		c.Review.MaxAgentConcurrency = 4
 	}
-	if c.Review.MaxFilesPerReview <= 0 {
-		c.Review.MaxFilesPerReview = 20
-	}
 	if c.Review.FilePackaging.MaxPackageSize <= 0 {
 		c.Review.FilePackaging.MaxPackageSize = 5
 	}
@@ -497,7 +494,7 @@ func (c *Config) ValidateRuntime() error {
 			}
 		}
 	}
-	for name, value := range map[string]int{"review.max_agent_concurrency": c.Review.MaxAgentConcurrency, "review.max_files_per_review": c.Review.MaxFilesPerReview, "review.max_diff_chars": c.Review.MaxDiffChars, "review.max_llm_calls": c.Review.MaxLLMCalls, "review.max_round_tokens": c.Review.MaxRoundTokens, "review.file_packaging.max_package_size": c.Review.FilePackaging.MaxPackageSize, "llm.max_tokens": c.LLM.MaxTokens, "llm.retry.max_attempts": c.LLM.Retry.MaxAttempts, "understanding.max_snapshot_bytes": c.Understanding.MaxSnapshotBytes} {
+	for name, value := range map[string]int{"review.max_agent_concurrency": c.Review.MaxAgentConcurrency, "review.max_diff_chars": c.Review.MaxDiffChars, "review.max_llm_calls": c.Review.MaxLLMCalls, "review.max_round_tokens": c.Review.MaxRoundTokens, "review.file_packaging.max_package_size": c.Review.FilePackaging.MaxPackageSize, "llm.max_tokens": c.LLM.MaxTokens, "llm.retry.max_attempts": c.LLM.Retry.MaxAttempts, "understanding.max_snapshot_bytes": c.Understanding.MaxSnapshotBytes} {
 		if value < 0 {
 			return fmt.Errorf("%s 不能为负数", name)
 		}

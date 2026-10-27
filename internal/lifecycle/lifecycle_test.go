@@ -239,7 +239,7 @@ func TestStopTerminatesSelectedAgentAndPreservesOtherWorkspace(t *testing.T) {
 	if !strings.Contains(out.String(), "agent=") {
 		t.Fatalf("agent missing from status: %s", &out)
 	}
-	if !strings.Contains(out.String(), "审核对象") || !strings.Contains(out.String(), "MR-8 Audit streamer") || !strings.Contains(out.String(), "150 (0+0)") {
+	if !strings.Contains(out.String(), "审核对象") || !strings.Contains(out.String(), "Audit streamer") || !strings.Contains(out.String(), "150 (0+0)") {
 		t.Fatalf("runtime details missing: %s", &out)
 	}
 	if err := Run(root, "stop", "gvs", &out); err != nil {

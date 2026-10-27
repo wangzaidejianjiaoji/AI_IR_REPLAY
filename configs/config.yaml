@@ -117,7 +117,6 @@ review:
   dry_run: true                   # demo 模式：只审查不发布评论（与 notification.pr_comment 双重保险）
   max_diff_chars: 60000           # 单包 diff 超长截断（字符数）
   max_agent_concurrency: 4        # 每批并发的 Agent 数量
-  max_files_per_review: 20        # 单次审查最大文件数
 
   # 文件打包配置（确定性工程：关联文件归并为同一审查包，上下文隔离）
   file_packaging:

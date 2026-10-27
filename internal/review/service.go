@@ -123,7 +123,7 @@ func NewService(cfg *config.Config, cliRulePath string, logger *slog.Logger) (*S
 		tz = time.Local
 	}
 
-	// Codeup 分支推送审查（可选）：客户端 + 分支基线存储
+	// Codeup 审查（可选）：客户端 + 分支基线存储
 	var cu *codeup.Client
 	var branchSt *state.Store
 	if cfg.Codeup.Enabled {
@@ -132,8 +132,12 @@ func NewService(cfg *config.Config, cliRulePath string, logger *slog.Logger) (*S
 		if err != nil {
 			return nil, fmt.Errorf("加载分支审查基线: %w", err)
 		}
-		logger.Info("分支推送审查已启用", "repos", len(cfg.Codeup.Repos),
-			"state_path", cfg.Codeup.StatePath)
+		if cfg.Codeup.BranchReview {
+			logger.Info("分支推送审查已启用", "repos", len(cfg.Codeup.Repos),
+				"state_path", cfg.Codeup.StatePath)
+		} else {
+			logger.Info("分支推送审查未启用（branch_review=false），仅审查不在开发中的 MR")
+		}
 	}
 
 	var changeAnalyzer *analyzer.Analyzer
@@ -196,7 +200,8 @@ func (s *Service) RunOnce(ctx context.Context) {
 			s.logger.Error("仓库审查失败", "repo", repo.Owner+"/"+repo.Repo, "error", err.Error())
 		}
 	}
-	// 【分支推送审查】扫描 Codeup 仓库分支 HEAD 变化，增量审查新提交
+	// 【分支推送审查】扫描 Codeup 仓库分支 HEAD 变化，增量审查新提交；
+	// 默认关闭：分支推送属开发中代码，审查对象应仅为不在开发中的 MR
 	if s.cu != nil {
 		for _, repo := range s.cfg.Codeup.Repos {
 			// 【MR 审查】扫描 Codeup 开启状态的合并请求（新版本未审时触发）
@@ -205,8 +210,10 @@ func (s *Service) RunOnce(ctx context.Context) {
 					s.logger.Error("MR 审查失败", "repo", repo.DisplayName(), "error", err.Error())
 				}
 			}
-			if err := s.reviewCodeupRepo(ctx, repo); err != nil {
-				s.logger.Error("分支推送审查失败", "repo", repo.DisplayName(), "error", err.Error())
+			if s.cfg.Codeup.BranchReview {
+				if err := s.reviewCodeupRepo(ctx, repo); err != nil {
+					s.logger.Error("分支推送审查失败", "repo", repo.DisplayName(), "error", err.Error())
+				}
 			}
 		}
 	}
@@ -361,10 +368,7 @@ func (s *Service) reviewDiff(ctx context.Context, rawDiff, repoFullName, title, 
 		log.Info("模型处于冷却期，先复用已有检查点；缺失结果时等待可用模型", "error", err)
 	}
 	totalFiltered := len(files)
-	if len(files) > s.cfg.Review.MaxFilesPerReview {
-		return nil, fmt.Errorf("审查覆盖不完整：筛选后有 %d 个文件，超过 max_files_per_review=%d；请拆分变更或提高上限后重新执行",
-			len(files), s.cfg.Review.MaxFilesPerReview)
-	}
+	// 大 MR 不再按文件数拦截：规模由分包、轮次预算（max_llm_calls/max_round_tokens）与时长约束。
 
 	// 【确定性工程】智能文件打包：关联文件归并为审查包，上下文隔离
 	var pkgs []packager.Package
@@ -699,6 +703,9 @@ func (s *Service) ReviewCodeupMR(ctx context.Context, repositoryID string, local
 		if mr.IsWIP() {
 			return fmt.Errorf("MR !%d 为 WIP", localID)
 		}
+		if mr.State == "UNDER_DEV" {
+			return fmt.Errorf("MR !%d 为开发中（UNDER_DEV），提交评审后再审查", localID)
+		}
 		if mr.HasConflict() {
 			return fmt.Errorf("MR !%d 存在合并冲突", localID)
 		}
@@ -727,6 +734,12 @@ func (s *Service) reviewCodeupMRs(ctx context.Context, repo config.CodeupRepoCon
 		// 【WIP 检测】开发中的 MR 暂不审查，移除 WIP 前缀后自动进入审查
 		if mr.IsWIP() {
 			s.logger.Debug("跳过 MR：开发中（WIP）", "repo", name, "mr", mr.LocalID, "title", mr.Title)
+			continue
+		}
+		// 【开发中状态】UNDER_DEV 的 MR 尚未提交评审，暂不审查；
+		// 提交评审（UNDER_REVIEW/TO_BE_MERGED）后自动进入审查
+		if mr.State == "UNDER_DEV" {
+			s.logger.Debug("跳过 MR：开发中（UNDER_DEV）", "repo", name, "mr", mr.LocalID, "title", mr.Title)
 			continue
 		}
 		// 【合并冲突检测】存在冲突的 MR 无法生成 diff，跳过以节省 API 与 LLM 配额

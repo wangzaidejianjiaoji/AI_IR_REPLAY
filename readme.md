@@ -5,9 +5,9 @@
 
 AI_IR_REPLAY 是一个 Go 实现的 AI 代码审查服务，Go module 与主程序名为 `gvs-pr-agent`。它从 GitHub PR、Codeup MR / 分支或本地 patch 获取变更，结合规则和可选的业务知识，组织多个专业角色审查，校验候选问题并生成 Markdown 报告；配置允许时将报告发布为平台评论。
 
-> 维护日期：2026-10-19。源码核对范围：`fd13ba6be450ba75f91ed2c795961e1b4f54f145` 及当前工作区的运行状态、理解增量更新和 Codeup MR 增量审核实现。本文兼顾上手入口与项目理解，采用 L0 系统关系、L1 模块职责、L2 调用链、L3 契约的粒度。它不代表真实供应商、远端评论、部署环境或缺陷检出率已经验收。
+> 维护日期：2026-10-26。源码核对范围：`fd13ba6be450ba75f91ed2c795961e1b4f54f145` 及当前工作区的运行状态、理解增量更新和 Codeup MR 增量审核实现。本文兼顾上手入口与项目理解，采用 L0 系统关系、L1 模块职责、L2 调用链、L3 契约的粒度。它不代表真实供应商、远端评论、部署环境或缺陷检出率已经验收。
 
-本次更新包含三项：Linux `status` 展示正在审核的任务、角色/包、耗时和实际返回 token；理解文档按差异分批应用补丁；Codeup MR 后续版本只审核相对上次成功版本的差异。标题/描述变化不触发重审，详细规则见下文及 [运行与增量审核说明](docs/persistent-control.md)。
+本次更新：定时审查只审核**不在开发中**的 Codeup MR（UNDER_DEV / WIP 跳过，提交评审后自动进入；分支推送审查默认关闭，`branch_review` 可选恢复）；gvs 与 gvs-infer 共享执行锁串行审核，每轮全局只审一个 MR；大 MR 放开限制（不限文件数、`max_tokens: 0` 不限输出长度、轮次预算放宽）；Linux `status` 以表格展示审核对象、阶段、角色/包、开始时间、耗时与 Token，并倒序罗列最近 10 条已结束审核历史。详细规则见下文及 [运行与增量审核说明](docs/persistent-control.md)。
 
 ## 0. 文档范围与阅读入口
 
@@ -47,7 +47,7 @@ AI_IR_REPLAY 是一个 Go 实现的 AI 代码审查服务，Go module 与主程�
 | 模型服务 | [internal/llm](internal/llm/client.go) 使用兼容 Chat Completions 的 HTTP JSON 接口；当前业务配置采用 Kimi，启用备用时降级到 MiniMax |
 | 业务知识 | [internal/understanding](internal/understanding/manager.go) 跟踪配置指定的 Codeup 仓库和来源分支；首次初始化从本地 Git 对象取得固定提交的选择性源码快照 |
 | 本地持久化 | JSON 基线、任务清单、模型冷却、发布回执、响应检查点和 Markdown 知识；没有数据库或外部消息队列 |
-| 调度 | 定时轮询和管理接口触发，无 PR Webhook 接收器；扫描可以重叠，同一共享运行目录中的实际审查流水线串行执行 |
+| 调度 | 定时轮询和管理接口触发，无 PR Webhook 接收器；扫描可以重叠，同一共享运行目录中的实际审查流水线串行执行（每轮全局只审核一个 MR） |
 | 输出 | 日志 / 标准输出和平台全局评论；问题中含文件与行号，但不是平台原生逐行 review comment |
 | 进程运维 | [internal/lifecycle](internal/lifecycle/lifecycle.go) 配合根目录 Bash / PowerShell 脚本管理 GVS、infer 两套配置对应的审核实例 |
 
@@ -112,7 +112,7 @@ flowchart LR
 
 ### 3.2 扫描、排队与固定版本
 
-[service.go](internal/review/service.go) 的 `RunOnce` 先收集 GitHub PR、Codeup MR 和分支任务，再交给 [runtime.go](internal/review/runtime.go) 的 `executeCollected`。发现阶段按入口应用 WIP、冲突和分支过滤并构造版本身份；排队时按持久任务版本去重，领取后再检查平台评论存证或成功基线。
+[service.go](internal/review/service.go) 的 `RunOnce` 先收集 GitHub PR、Codeup MR 和分支任务，再交给 [runtime.go](internal/review/runtime.go) 的 `executeCollected`。发现阶段按入口应用开发中（UNDER_DEV）、WIP、冲突和分支过滤并构造版本身份；排队时按持久任务版本去重，领取后再检查平台评论存证或成功基线。
 
 `runtimeQueue` 在 `review.runtime_dir/tasks` 保存任务，`queue.lock` 保护清单，`execution.lock` 保护整条审核流水线。候选按上次尝试时间、创建时间和任务键排序，结合 `RetryAt` 与最近扫描时间选择；其他所有者的队首任务留给对应实例执行。每轮最多启动一次包含待审文件的 `reviewDiff`，此前可跳过多个无需审查的任务。
 
@@ -123,15 +123,15 @@ flowchart LR
 | 入口 | 审查身份与差异来源 |
 |---|---|
 | GitHub PR | 轮询过滤目标分支；源 SHA、目标 SHA、标题 / 描述和配置 / 规则依赖参与版本识别；使用固定 SHA compare，获取 diff 后及发布前复查版本、状态和元数据 |
-| Codeup MR | 轮询过滤源分支，手动指定模式绕过该分支过滤；按已成功审核的源 / 目标 SHA 去重，标题 / 描述修改不触发审核。目标 SHA 相同的新源版本只审核上次成功源版本到当前版本的直接差异；首次或目标基线变化时审核完整 MR 差异 |
-| Codeup 分支 | 持久基线与当前 HEAD 的 compare；首次发现且 `review_first_push=false` 时只记录基线；相同 HEAD 已完成后仅改规则 / 配置不会触发分支重审 |
+| Codeup MR | 轮询过滤源分支，手动指定模式绕过该分支过滤；按已成功审核的源 / 目标 SHA 去重，标题 / 描述修改不触发审核。目标 SHA 相同的新源版本只审核上次成功源版本到当前版本的直接差异；首次或目标基线变化时审核完整 MR 差异；开发中（UNDER_DEV / WIP）的 MR 跳过，提交评审后自动进入审查 |
+| Codeup 分支 | 持久基线与当前 HEAD 的 compare；首次发现且 `review_first_push=false` 时只记录基线；相同 HEAD 已完成后仅改规则 / 配置不会触发分支重审；分支推送审查由 `branch_review` 控制，GVS / infer 默认关闭 |
 | 本地 diff | 标题、patch 内容及配置 / 规则依赖形成响应缓存身份，不需要远端 PR |
 
 固定版本复查与远端发布之间仍有时间窗口，平台 API 与本地文件不是跨系统事务。
 
 Codeup MR 示例：v5 成功后，v6 只审 v5 → v6；v6 失败则基线仍是 v5，后续 v7 审 v5 → v7。版本间直接比较两个提交的文件树；差异为空时，复查版本后推进基线，不调用模型、不发布报告。报告注明增量起止 SHA，检查点和发布回执包含起点。目标 SHA 变化仍完整复查；旧源提交不可读取则报错保留基线。沿用原状态文件，无需清空旧记录；仅修改规则/配置也不会让相同成功代码快照重审。这些规则针对 Codeup MR，GitHub PR 保持原流程。
 
-当前发现范围有分页限制：GitHub Open PR 仅第一页，评论存证查询仅首 100 条；Codeup 开启 MR 仅第一页，指定 MR 也从这份列表选择；Codeup 分支最多 20 页、每页最多 100。仓库候选量超过范围时可能未被发现，不能把“本轮无任务”直接解释为全部已审。关闭 `commit_comment` 只关闭分支评论，不关闭分支扫描或模型调用。
+当前发现范围有分页限制：GitHub Open PR 仅第一页，评论存证查询仅首 100 条；Codeup 开启 MR 仅第一页，指定 MR 也从这份列表选择；Codeup 分支最多 20 页、每页最多 100。仓库候选量超过范围时可能未被发现，不能把“本轮无任务”直接解释为全部已审。分支扫描由 `branch_review` 控制（默认关闭，审核对象仅为不在开发中的 MR）；开启后 `commit_comment` 只控制是否回写 commit 评论。
 
 ### 3.3 共享审查流水线
 
@@ -177,13 +177,13 @@ Codeup MR 示例：v5 成功后，v6 只审 v5 → v6；v6 失败则基线仍是
 
 | 配置 | 程序缺省值 | GVS / infer 业务配置当前值 |
 |---|---|---|
-| `review.max_files_per_review` | 20 | 100 |
 | `review.max_diff_chars` | 60000 字节 | 120000 字节 |
 | `review.file_packaging.max_package_size` | 5 | 5 |
-| `review.max_agent_concurrency` | 4 | 4 |
-| `review.max_llm_calls` | 100 | 600 |
-| `review.max_round_tokens` | 1000000 | 12000000 |
-| `review.round_timeout` | 20m | 60m |
+| `review.max_agent_concurrency` | 4 | 2（供应商账号级并发上限） |
+| `review.max_llm_calls` | 100 | 3000 |
+| `review.max_round_tokens` | 1000000 | 60000000 |
+| `review.round_timeout` | 20m | 240m |
+| `llm.max_tokens` | 0（不限输出） | 0（请求不携带该参数） |
 | `review.max_round_cost` | 0，关闭费用预算 | 0 |
 | `review.runtime_dir` | `./data/review-runtime` | 两实例共享该目录 |
 | `review.checkpoint_dir` | `./data/checkpoints` | 两实例使用该目录，缓存身份隔离 |
@@ -192,7 +192,7 @@ Codeup MR 示例：v5 成功后，v6 只审 v5 → v6；v6 失败则基线仍是
 
 ### 4.2 模型请求、降级与预算
 
-模型客户端向 `base_url/chat/completions` POST，发送 model、messages、max_tokens、temperature，key 通过 Authorization 头传递。网络和可重试 HTTP 错误按策略重试；鉴权、供应商配额、普通请求错误分别处理，不能把所有失败都解释为限流。
+模型客户端向 `base_url/chat/completions` POST，发送 model、messages、temperature（`max_tokens` 为 0 时不携带该参数，输出长度不设限），key 通过 Authorization 头传递。网络和可重试 HTTP 错误按策略重试；鉴权、供应商配额、普通请求错误分别处理，不能把所有失败都解释为限流。
 
 业务配置的备用链路为 Kimi → MiniMax。每次 PR 审查尝试新建 `ReviewSession`；未命中响应检查点时，依据已知冷却状态选择主备，不进行远端可用性预检，该尝试一旦降级不回跳。供应商冷却持久化到共享运行目录，与响应缓存分离；冷却期间允许复用已有响应，缺少缓存且全部供应商不可用时等待后续尝试。
 
@@ -320,9 +320,9 @@ bash ./start-persistent.sh --action status
 bash ./start-persistent.sh gvs --action stop
 ```
 
-这些是操作示例，不自动执行启停。status 除进程信息外还显示当前/最近审核的任务、标题、阶段、角色与包、开始时间、耗时及实际返回的 token 用量；状态每 15 秒更新，陈旧或不匹配进程的文件不会作为实时状态展示。stop 会中断工作；stop/status/restart 不能混用 MR、模式或检查点参数。首次构建独立管理工具、凭据文件位置及手动调用详见常驻启停文档。
+这些是操作示例，不自动执行启停。status 除进程信息外以表格展示当前审核及历史的审核对象（仓库 + MR 标题）、阶段、运行中的角色/包、开始时间、耗时与 Token（输入+输出）；当前无审核时只列历史（最近 10 条倒序，实例停止时同样罗列），分支推送审查条目不记录不展示。状态每 15 秒更新，陈旧或不匹配进程的文件不会作为实时状态展示。stop 会中断工作；stop/status/restart 不能混用 MR、模式或检查点参数。首次构建独立管理工具、凭据文件位置及手动调用详见常驻启停文档。
 
-持续观察 infer 可运行 `watch -n 2 'bash ./start-persistent.sh gvs-infer --action status'`。耗时覆盖整个尝试；token 累计本次新请求已返回的供应商 usage，缓存命中不重复计数。等待中的请求尚无 usage，`usage_missing` 表示缺失用量，显示值可能低于实际账单；它不是预算预留值。重试从新的尝试重新计数。升级需重建审核程序及独立管理工具（若使用），再重启才能显示新字段。
+持续观察 infer 可运行 `watch -n 2 'bash ./start-persistent.sh gvs-infer --action status'`。耗时覆盖整个尝试；token 累计本次新请求已返回的供应商 usage，缓存命中不重复计数。等待中的请求尚无 usage，`usage_missing` 表示缺失用量，显示值可能低于实际账单；它不是预算预留值。重试从新的尝试重新计数；已结束审核追加记录到 `data/runtime/<配置名>.history.jsonl`（保留最近 100 条）。升级需重建审核程序及独立管理工具（若使用），再重启才能显示新字段。
 
 注意区分 `data/runtime`（脚本日志/PID、审核状态 JSON）与 `data/review-runtime`（执行锁、任务、冷却、回执）。程序默认管理端口为 8081，GVS YAML 为 8083、infer YAML 为 8082；Windows 常驻脚本可覆盖 GVS 为 8081，最终以启动环境和日志为准。
 
@@ -351,7 +351,7 @@ Compose 默认注入 dry-run=true，管理令牌为必填；若切到 GVS/infer 
 
 | 现象 | 优先核对 | 不能直接推出 |
 |---|---|---|
-| 每分钟扫描却没有新审核 | 时间窗口 → 平台列表范围 → WIP/冲突/分支过滤 → 已完成身份 → 执行锁/归属/RetryAt | 调度器坏了，或仓库全部已审 |
+| 每分钟扫描却没有新审核 | 时间窗口 → 平台列表范围 → 开发中（UNDER_DEV）/WIP/冲突/分支过滤 → 已完成身份 → 执行锁/归属/RetryAt | 调度器坏了，或仓库全部已审 |
 | `另一个实例正在审核 PR；本次不领取` | 同机共享目录及持锁进程；正常等待后续扫描 | 应删除 execution.lock 或启动更多实例 |
 | 已有“审查完成”，没有平台评论 | 后续完整性错误 → 版本变化 → dry-run/评论开关 → 回执 | 已发布成功或平台必然故障 |
 | 指定 MR 提示找不到 | 编号与配置仓库、开启状态、MR 列表第一页范围 | 任意 MR 编号都能直接按 ID 读取 |

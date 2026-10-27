@@ -372,6 +372,9 @@ func (s *Service) executeCollected(ctx context.Context, candidates []reviewCandi
 		} else {
 			finishProgress("interrupted")
 		}
+		// 串行保证：执行锁（共享 runtime_dir 的 execution.lock）使任意时刻全局只有一个
+		// 实例在审核；且每轮最多执行一个真实 MR 审查（去重跳过不算），审核完即释放锁，
+		// 让 gvs / gvs-infer 轮流获得执行权。
 		if attempt.started || err != nil {
 			return err
 		}

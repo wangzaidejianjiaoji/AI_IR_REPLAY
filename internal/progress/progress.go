@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -42,15 +43,15 @@ const (
 	historyShown = 10  // status 表格最多展示的历史行数
 )
 
-var tableHeader = []string{"审核对象", "阶段", "运行中的角色/包", "开始时间", "耗时", "Token"}
+var tableHeader = []string{"审核对象", "阶段", "首次开始", "最近结束", "累计耗时", "尝试", "Token"}
 
 type Tracker struct {
-	mu           sync.Mutex
-	snapshot     Snapshot
-	generation   uint64
-	path         string
-	historyPath  string
-	logger       *slog.Logger
+	mu          sync.Mutex
+	snapshot    Snapshot
+	generation  uint64
+	path        string
+	historyPath string
+	logger      *slog.Logger
 }
 
 type trackerKey struct{}
@@ -119,7 +120,8 @@ func Begin(ctx context.Context, task, version string) func(string) {
 		}
 		t.mu.Unlock()
 		t.Publish()
-		if terminal {
+		// 审核历史仅记录 MR/PR 审查；分支推送属开发中代码，不进入 status 表格
+		if terminal && !strings.HasPrefix(finished.Task, "branch:") {
 			if err := appendHistory(t.historyPath, finished); err != nil && t.logger != nil {
 				t.logger.Warn("保存审核历史失败", "error", err)
 			}
@@ -285,7 +287,9 @@ func (t *Tracker) Run(ctx context.Context, interval time.Duration) func() {
 }
 
 // Print 以表格展示审核进度：仅当 pid 对应的存活审核进程正在审核时展示当前行，
-// 否则只罗列历史（倒序，最多 historyShown 条）；pid<=0 表示实例已停止，只罗列历史。
+// 否则只罗列历史（倒序，最多 historyShown 个审核对象）；pid<=0 表示实例已停止，只罗列历史。
+// 历史按审核对象（任务+版本）聚合：对象未变时合并多次重试，
+// 展示最早开始时间、最近结束时间、累计耗时与累计 token。
 func Print(path string, pid int, output io.Writer) error {
 	raw, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
@@ -300,8 +304,8 @@ func Print(path string, pid int, output io.Writer) error {
 	}
 	live := pid > 0 && haveStatus && s.PID == pid && time.Since(s.UpdatedAt) <= time.Minute
 	history := readHistory(historyPathFor(path))
-	if live && s.State == "reviewing" {
-		renderTable(output, append([][]string{snapshotRow(&s, true)}, historyRows(history)...))
+	if live && s.State == "reviewing" && !strings.HasPrefix(s.Task, "branch:") {
+		renderTable(output, groupRows(liveGroups(&s, history)))
 		return nil
 	}
 	if haveStatus && pid > 0 && s.State == "reviewing" {
@@ -318,62 +322,208 @@ func Print(path string, pid int, output io.Writer) error {
 	return nil
 }
 
-// historyRows 将历史条目转为倒序表格行。
+// historyRows 将历史尝试按审核对象（任务+版本未变）聚合并转为倒序表格行；
+// 分支推送审查条目不展示（历史文件兼容）。
 func historyRows(history []Snapshot) [][]string {
-	rows := make([][]string, 0, historyShown)
-	for i := len(history) - 1; i >= 0 && len(rows) < historyShown; i-- {
-		rows = append(rows, snapshotRow(&history[i], false))
+	groups := aggregateHistory(history)
+	if len(groups) > historyShown {
+		groups = groups[:historyShown]
+	}
+	return groupRows(groups)
+}
+
+// reviewGroup 聚合同一审核对象（任务与版本均未变）的多次尝试，
+// 展示最早开始、最近结束、累计耗时与累计 token，替代逐次尝试的历史行。
+type reviewGroup struct {
+	task       string
+	version    string
+	repository string
+	title      string
+	stage      string
+	state      string
+	firstStart time.Time
+	lastEnd    time.Time
+	elapsed    float64
+	prompt     int
+	completion int
+	total      int
+	attempts   int
+	live       bool
+	liveStart  time.Time
+}
+
+func groupKey(task, version string) string { return task + "\x00" + version }
+
+// merge 并入一次已结束的尝试；历史按时间正序追加，最后合并的尝试最新。
+func (g *reviewGroup) merge(s *Snapshot) {
+	if g.attempts == 0 {
+		g.task, g.version = s.Task, s.Version
+	}
+	if !s.StartedAt.IsZero() && (g.firstStart.IsZero() || s.StartedAt.Before(g.firstStart)) {
+		g.firstStart = s.StartedAt
+	}
+	if end := s.FinishedAt; !end.IsZero() && end.After(g.lastEnd) {
+		g.lastEnd = end
+	}
+	g.elapsed += s.ElapsedSeconds
+	g.prompt += s.PromptTokens
+	g.completion += s.CompletionTokens
+	g.total += s.TotalTokens
+	g.stage, g.state = s.Stage, s.State
+	if s.Repository != "" {
+		g.repository = s.Repository
+	}
+	if s.Title != "" {
+		g.title = s.Title
+	}
+	g.attempts++
+}
+
+// mergeLive 并入进行中的尝试：token 用量累加，耗时在渲染时按当前时刻实时计算。
+func (g *reviewGroup) mergeLive(s *Snapshot) {
+	if g.attempts == 0 {
+		g.task, g.version = s.Task, s.Version
+	}
+	if !s.StartedAt.IsZero() && (g.firstStart.IsZero() || s.StartedAt.Before(g.firstStart)) {
+		g.firstStart = s.StartedAt
+	}
+	g.prompt += s.PromptTokens
+	g.completion += s.CompletionTokens
+	g.total += s.TotalTokens
+	g.stage, g.state = s.Stage, s.State
+	if s.Repository != "" {
+		g.repository = s.Repository
+	}
+	if s.Title != "" {
+		g.title = s.Title
+	}
+	g.live = true
+	g.liveStart = s.StartedAt
+	g.attempts++
+}
+
+// aggregateHistory 按审核对象聚合历史尝试（组内保持时间正序合并），
+// 组间按最近结束时间倒序返回。
+func aggregateHistory(history []Snapshot) []*reviewGroup {
+	byKey := map[string]*reviewGroup{}
+	var groups []*reviewGroup
+	for i := range history {
+		if strings.HasPrefix(history[i].Task, "branch:") {
+			continue
+		}
+		key := groupKey(history[i].Task, history[i].Version)
+		g, ok := byKey[key]
+		if !ok {
+			g = &reviewGroup{}
+			byKey[key] = g
+			groups = append(groups, g)
+		}
+		g.merge(&history[i])
+	}
+	sort.SliceStable(groups, func(i, j int) bool { return groups[i].lastEnd.After(groups[j].lastEnd) })
+	return groups
+}
+
+// liveGroups 把进行中的尝试并入门键一致的聚合组并置于首行，其余组保持倒序。
+func liveGroups(live *Snapshot, history []Snapshot) []*reviewGroup {
+	groups := aggregateHistory(history)
+	key := groupKey(live.Task, live.Version)
+	var current *reviewGroup
+	rest := make([]*reviewGroup, 0, len(groups))
+	for _, g := range groups {
+		if groupKey(g.task, g.version) == key {
+			current = g
+			continue
+		}
+		rest = append(rest, g)
+	}
+	if current == nil {
+		current = &reviewGroup{}
+	}
+	current.mergeLive(live)
+	if len(rest) > historyShown {
+		rest = rest[:historyShown]
+	}
+	return append([]*reviewGroup{current}, rest...)
+}
+
+// groupRows 将聚合组转为表格行；同一审核对象出现多个版本时追加短版本号区分。
+func groupRows(groups []*reviewGroup) [][]string {
+	tasks := map[string]int{}
+	for _, g := range groups {
+		tasks[g.task]++
+	}
+	rows := make([][]string, 0, len(groups))
+	for _, g := range groups {
+		rows = append(rows, groupRow(g, tasks[g.task] > 1))
 	}
 	return rows
 }
 
-// snapshotRow 把一次审核快照转成表格行；live 时耗时按当前时刻实时计算。
-func snapshotRow(s *Snapshot, live bool) []string {
-	elapsed := s.ElapsedSeconds
-	if live && !s.StartedAt.IsZero() {
-		elapsed = time.Since(s.StartedAt).Seconds()
-	}
-	stage := s.Stage
+// groupRow 把一个聚合组转成表格行；进行中的尝试耗时按当前时刻实时累计。
+func groupRow(g *reviewGroup, multiVersion bool) []string {
+	stage := g.stage
 	if stage == "" {
-		stage = s.State
-	} else if !live {
-		switch s.State {
+		stage = g.state
+	}
+	elapsed := g.elapsed
+	end := timeLabel(g.lastEnd)
+	if g.live {
+		if !g.liveStart.IsZero() {
+			elapsed += time.Since(g.liveStart).Seconds()
+		}
+		end = "进行中"
+	} else {
+		switch g.state {
 		case "completed":
 			stage = "完成"
 		case "interrupted":
 			stage = "中断·" + stage
 		}
 	}
-	return []string{objectLabel(s), stage, jobsLabel(s.ActiveJobs), startedLabel(s.StartedAt), formatDuration(elapsed), tokenLabel(s)}
+	return []string{
+		objectLabel(g.repository, g.title, g.task, g.version, multiVersion),
+		stage,
+		timeLabel(g.firstStart),
+		end,
+		formatDuration(elapsed),
+		strconv.Itoa(g.attempts),
+		tokenLabel(g.total, g.prompt, g.completion),
+	}
 }
 
-// objectLabel 汇总审核对象：任务标识 + 标题。
-func objectLabel(s *Snapshot) string {
-	object := s.Task
+// objectLabel 汇总审核对象：仓库 + MR 标题（如 "lzvsg/gvs MR !541 xxx"）；
+// 缺标题时回退任务标识；同一对象出现多个版本时追加 @短版本号区分。
+func objectLabel(repository, title, task, version string, multiVersion bool) string {
+	object := title
 	if object == "" {
-		object = s.Repository
+		object = task
 	}
-	if s.Title != "" {
-		object = strings.TrimSpace(object + " " + s.Title)
+	if object == "" {
+		object = repository
+	}
+	if repository != "" && object != repository {
+		object = repository + " " + object
 	}
 	if object == "" {
 		object = "-"
 	}
+	if multiVersion && version != "" {
+		short := version
+		if len(short) > 7 {
+			short = short[:7]
+		}
+		object += " @" + short
+	}
 	return truncate(object, 60)
 }
 
-func jobsLabel(jobs []string) string {
-	if len(jobs) == 0 {
+// timeLabel 展示首次开始/最近结束时刻。
+func timeLabel(moment time.Time) string {
+	if moment.IsZero() {
 		return "-"
 	}
-	return truncate(strings.Join(jobs, ","), 40)
-}
-
-func startedLabel(started time.Time) string {
-	if started.IsZero() {
-		return "-"
-	}
-	return started.Local().Format("2006-01-02 15:04:05")
+	return moment.Local().Format("2006-01-02 15:04:05")
 }
 
 func formatDuration(seconds float64) string {
@@ -394,12 +544,12 @@ func formatDuration(seconds float64) string {
 	}
 }
 
-// tokenLabel 展示合计 token 及输入/输出拆分。
-func tokenLabel(s *Snapshot) string {
-	if s.TotalTokens == 0 && s.PromptTokens == 0 && s.CompletionTokens == 0 {
+// tokenLabel 展示累计 token 及输入/输出拆分。
+func tokenLabel(total, prompt, completion int) string {
+	if total == 0 && prompt == 0 && completion == 0 {
 		return "0"
 	}
-	return fmt.Sprintf("%d (%d+%d)", s.TotalTokens, s.PromptTokens, s.CompletionTokens)
+	return fmt.Sprintf("%d (%d+%d)", total, prompt, completion)
 }
 
 // truncate 按显示宽度截断并在末尾补省略号。

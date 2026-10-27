@@ -1,6 +1,6 @@
 # AI_IR_REPLAY：整体架构、数据流与代码审查流程
 
-> 文档维护日期：2026-10-19。源码核对范围：`fd13ba6be450ba75f91ed2c795961e1b4f54f145` 及当前工作区的运行状态、理解增量更新和 Codeup MR 增量审核实现。本次同步相关说明，验证范围见第 8 节，历史记录见 [自审记录](docs/review-self-audit.md)，需求见 [prd.md](prd.md)，运行操作见 [常驻审核一键启停](docs/persistent-control.md)。源码能力、历史测试结果与当前部署状态分别解读，本文不据此认定运行实例已更新。
+> 文档维护日期：2026-10-26。源码核对范围：`fd13ba6be450ba75f91ed2c795961e1b4f54f145` 及当前工作区的运行状态、理解增量更新和 Codeup MR 增量审核实现。本次同步相关说明，验证范围见第 8 节，历史记录见 [自审记录](docs/review-self-audit.md)，需求见 [prd.md](prd.md)，运行操作见 [常驻审核一键启停](docs/persistent-control.md)。源码能力、历史测试结果与当前部署状态分别解读，本文不据此认定运行实例已更新。
 
 ## 1. 项目定位与阅读入口
 
@@ -72,7 +72,7 @@ AI_IR_REPLAY（项目名；Go module 即 Go 模块名为 gvs-pr-agent，表示�
 | 是否对外发布 | `review.dry_run`、`notification.pr_comment`、`codeup.commit_comment`、`codeup.mr_comment` | `dry_run=true` 禁止全部评论发布；正式发布还需对应评论开关允许。GVS / infer 配置当前发布 MR 评论、不发 commit 评论；试运行仍可能收费、写知识和推进 Codeup 基线 |
 | 首次发现分支如何处理 | `codeup.review_first_push` | 当前业务配置为 `false`，首次只记录 HEAD；设为 `true` 才与配置的基准分支比较并审查。该选择影响首次审查工作量及模型消耗 |
 | 知识失败时是否继续 | `understanding.strict`、`source_repository/source_branch`、`snapshot_repository` | 当前业务配置 `strict=false`，更新失败可披露降级后使用可信旧知识，无法取得合法快照时可能以空知识继续；要求知识准备成功时设为 `true`。首次初始化需补齐本地源码仓库；缺失来源、来源不匹配或冲突 SHA 的知识拒绝复用 |
-| 可接受的审查规模与成本 | `max_files_per_review`、`max_diff_chars`、`max_llm_calls`、`max_round_tokens`、`round_timeout`、`max_round_cost` | 文件数和差异字节决定审查规模；调用次数、估算预留量和时长限制按每 PR 实际尝试建立，重试和主备共享预算。金额上限大于 0 时需配置主备价格，估算不等于账单硬上限 |
+| 可接受的审查规模与成本 | `max_diff_chars`、`max_llm_calls`、`max_round_tokens`、`round_timeout`、`max_round_cost` | 差异字节决定审查规模（文件数不设上限，允许审核大 MR）；调用次数、估算预留量和时长限制按每 PR 实际尝试建立，重试和主备共享预算。金额上限大于 0 时需配置主备价格，估算不等于账单硬上限 |
 | 状态隔离与恢复 | `codeup.state_path`、`understanding.document_path`、`review.checkpoint_dir`、`review.runtime_dir` | GVS / infer、试点 / 正式环境分别隔离基线与知识；参与串行调度的同机实例共用运行目录。检查点默认 `./data/checkpoints`，任务、锁、冷却和回执位于运行目录，不能把清缓存当作清除成功基线 |
 | 模型服务与备用凭据 | `llm.api_key/base_url/models`、`llm.fallback` 中的对应字段 | 主备端点、模型和凭据均需可用；档位可指向同一模型。启用备用策略不保证备用服务有权限或配额，真实可用性需请求验证 |
 | 审查时段与手动触发权限 | `review.active_hours`、`server.admin_token`、`server.addr` | 时间窗口约束常驻扫描、`-once` 和指定 MR；本地 diff 不受该窗口限制。HTTP 手动触发需要令牌，非回环监听必须配置令牌；接受触发不等于审核完成 |
@@ -84,7 +84,7 @@ AI_IR_REPLAY（项目名；Go module 即 Go 模块名为 gvs-pr-agent，表示�
 | 场景 | 当前处理 | 使用时要确认 |
 |---|---|---|
 | MR 合并前评审 | 审固定源/目标版本的差异，生成 MR 全局评论 | MR 开关、源分支过滤、WIP/冲突及评论权限；报告不替代 CI |
-| 尚未创建 MR 的分支推送 | 从该分支已处理基线增量审查 | 首次默认只登记；关闭 commit 评论不关闭分支模型调用 |
+| 尚未创建 MR 的分支推送 | 由 `branch_review` 控制，默认关闭；开启后从该分支已处理基线增量审查 | 首次默认只登记；`commit_comment=false` 只关闭分支评论 |
 | 手动复核一个 MR | 单次选择配置中的仓库与 MR，绕过轮询源分支过滤 | 不绕过去重、时间窗口、WIP、冲突或版本检查；不能作为强制重审命令 |
 | 本地 patch 联调 | 相同共享流水线，输出到终端 | 使用 Mock 可避免真实模型请求；真实配置开启理解时仍可能访问平台 |
 | 每分钟发现、长时间审核 | 扫描继续登记，实际审核由共享锁串行 | 一分钟不是完成 SLA；积压与重试取决于任务量、耗时、配额和有效候选 |
@@ -222,7 +222,7 @@ flowchart TD
 
 原始 unified diff 经 `diff.Parse` 转成 `FileDiff`，保留路径、补丁、新文件 hunk 行号范围、增删行数、二进制/删除标记。`filter.Files` 应用 include/exclude，并剔除二进制和已删除文件。因此报告的文件覆盖分母是**过滤后的文件**，并非平台 PR 的所有文件；删除文件的风险当前不会直接进入专业审查。
 
-文件数超过 `max_files_per_review` 直接报错。开启分包后，`PackBounded` 按模块、文件条目数和字节预算组织包；超大单文件拆成多个完整 hunk 片段，保留文件头和原行号。同一文件可出现于多个包，包数不等于文件数。单个 hunk 连同必要文件头仍超限则失败，不只取前半段审核。关闭分包时所有文件构成一个包，仍须满足字节预算。
+文件数不设上限（max_files_per_review 已移除），大 MR 按分包与轮次预算约束。开启分包后，`PackBounded` 按模块、文件条目数和字节预算组织包；超大单文件拆成多个完整 hunk 片段，保留文件头和原行号。同一文件可出现于多个包，包数不等于文件数。单个 hunk 连同必要文件头仍超限则失败，不只取前半段审核。关闭分包时所有文件构成一个包，仍须满足字节预算。
 
 规则有两层操作：启动时按 `-rule > rules.project_path > rules.global_path > 内嵌默认` **选定一份文档**；专业作业执行前，再从该文档组合全局规则、该角色规则及包内命中路径的规则。热更新可以影响后续审核尝试，当前尝试固定所用规则，避免中途一部分作业读旧规则、一部分读新规则。
 
@@ -262,7 +262,7 @@ flowchart TD
 
 一个专业作业读取：**仓库/PR 元数据 + 当前包 diff + 共享 ChangeContext + 当前角色规则及重点**。专业提示词中的 PR 正文目前只保留前 500 字节；它不会自动读取另一角色的结果、其他包的原始全文或整个仓库调用图。各作业独立提出候选，后续由协调器汇总；角色优先级决定执行先后，不表示后执行角色继承先执行角色的判断。
 
-优先级数值较小的整批先执行，等待该批结束后再运行下一批；同批通过信号量限制并发。当前 GVS/infer 的 `max_agent_concurrency=4`，表示一个 PR 内最多 4 个专业作业并发。跨 PR 仍只有一个审核执行槽，不能把该值理解为可同时审核 4 个 PR。
+优先级数值较小的整批先执行，等待该批结束后再运行下一批；同批通过信号量限制并发。当前 GVS/infer 的 `max_agent_concurrency=2`（供应商账号级并发上限，403 concurrent limit 自动退避重试），表示一个 PR 内最多 2 个专业作业并发。跨 PR 仍只有一个审核执行槽，不能把该值理解为可同时审核 4 个 PR。
 
 `baseAgent.Review` 构造 system/user 消息，调用统一 `llm.Client.Chat`，将模型响应解析为 `[]Issue`。每项包含 `severity`、`file`、`line`、`problem`、`detail`、`suggestion` 和可选 `code`；程序补充来源角色和显示名，归一化严重度。JSON 解析失败会失效该响应缓存并最多再尝试一次；HTTP 层的重试另算，均受本 PR 预算约束。
 
@@ -296,7 +296,7 @@ flowchart TD
 
 一次 `Chat` 先检查取消及匹配的响应检查点。有效缓存直接返回，新增用量记零，不重新预留本轮请求预算。缺少缓存才进入供应商选择、已知冷却判断、预算预留和 HTTP 请求；成功响应保存后返回，消费者拒绝结构或协议时会使对应缓存失效。
 
-每个 PR 执行尝试有新路由会话：先评估 Kimi 的已知冷却，未知可用性由首个实际请求验证，不额外发收费探针。HTTP 429，或响应体有额度证据的 HTTP 403，按配额规则记录冷却，优先采用 `Retry-After`；结构化认证/无效参数错误不按配额处理。普通网络/暂时错误按配置有限重试，耗尽后可切 MiniMax。普通鉴权/权限错误不会一律当作额度问题降级。一次尝试降级后，后续路由选择保持备用模型；已经发出的并发请求不会被撤回。下次尝试重新评估 Kimi，仍遵守持久化冷却。
+每个 PR 执行尝试有新路由会话：先评估 Kimi 的已知冷却，未知可用性由首个实际请求验证，不额外发收费探针。HTTP 429，或响应体有额度证据的 HTTP 403，按配额规则记录冷却，优先采用 `Retry-After`；结构化认证/无效参数错误不按配额处理。普通网络/暂时错误按配置有限重试（供应商并发上限 403 属瞬态错误，自动退避重试），耗尽后可切 MiniMax。输出被截断（finish_reason=length）或空内容按明确错误重试，不再交给下游解析；`max_tokens: 0` 时请求不携带输出上限，由供应商使用模型默认输出能力。普通鉴权/权限错误不会一律当作额度问题降级。一次尝试降级后，后续路由选择保持备用模型；已经发出的并发请求不会被撤回。下次尝试重新评估 Kimi，仍遵守持久化冷却。
 
 两个模型均冷却时，仍可重放已有响应；只有需要新请求而无可用模型时才中断。`max_llm_calls`、`max_round_tokens`、`round_timeout` 和可选 `max_round_cost` 作用于**一个 PR 的一次执行尝试**，包括知识、分析、专业审查、确认以及 HTTP 重试。恢复时建立新尝试预算，不是同一 PR 跨所有重试的终身额度上限；具体估算和成本边界见第 9 节。
 
@@ -362,7 +362,7 @@ flowchart TD
 
 | 观察到的现象 | 对应阶段 | 应优先核对 |
 |---|---|---|
-| 有“获取 Open PR/MR 列表”，没有“开始审查” | 发现/队列/过滤 | 时间窗口、WIP/冲突、分支筛选、已审身份、共享执行锁、任务所属实例与重试时间 |
+| 有“获取 Open PR/MR 列表”，没有“开始审查” | 发现/队列/过滤 | 时间窗口、开发中（UNDER_DEV）、WIP/冲突、分支筛选、已审身份、共享执行锁、任务所属实例与重试时间 |
 | 有“开始审查”，没有专业角色开始日志 | 知识或变更分析 | 知识来源/版本、模型可用性、分析错误与预算 |
 | 某角色在一个包成功，另一包失败 | 专业作业 | 按包×角色看 `SuccessfulJobs/FailedJobs`，不能只看角色是否出现过 |
 | 所有专业作业结束，仍未发布 | 候选确认或完成检查 | 确认协议、超限、取消、版本变化及本地持久化错误 |
@@ -404,7 +404,6 @@ flowchart TD
 
 ## 5. 工程校验与失败语义
 
-- 文件过滤后数量超出 max_files_per_review（单次审查文件数上限），会报错阻断，不抽样通过。
 - Service 使用 PackBounded 按模块、数量及字节预算分包；超大文件按完整 hunk 拆分，保留原文件头、路径、行号范围和每片变更计数。单 hunk 连同头部超预算，或关闭分包后整包超预算，在模型前阻断。全局分析逐包并分层归并，摘要无法容纳或无法继续缩小时报错。
 - 定位器匹配 diff 文件、校验新文件 hunk（差异块）行号，允许 3 行边界吸附；无法定位可降级 line=0（只有文件位置，没有具体行号）。其作用是约束位置，不能证明问题真实。
 - 反思器检查 detail（问题详细说明字段）中反引号引用是否出现在拼接的 diff 中，仅对 .go 文件的建议片段做 Go 语法检查，并合并相似发现。C++ 建议保留但没有语法校验；这些步骤不是语义证明。
@@ -465,8 +464,8 @@ flowchart TD
 | 配置文件 | 用途 |
 |---|---|
 | configs/config.mock.yaml | 本地 Mock（模拟模型服务），理解模块未开启，用于工程流程演示 |
-| configs/config-gvs.yaml | GVS，当前 dry_run=false，可能发布真实评论；600 次调用、12000000 估算 Token、60m、单包 120000 字节、最多 100 文件 |
-| configs/config-gvs-infer.yaml | infer，当前 dry_run=false，可能发布真实评论；预算与文件上限同 GVS |
+| configs/config-gvs.yaml | GVS，当前 dry_run=false，可能发布真实评论；3000 次调用、60000000 估算 Token、240m、单包 120000 字节、不限文件数、并发 2、输出不限长、仅审不在开发中的 MR |
+| configs/config-gvs-infer.yaml | infer，当前 dry_run=false，可能发布真实评论；预算与审查范围同 GVS |
 | configs/config-codeup.yaml | Codeup 场景，dry_run=false，可能发布真实评论 |
 | configs/config.yaml | 默认配置，运行前检查目标仓库与所有发布开关 |
 
@@ -476,7 +475,7 @@ Windows/Linux 的 start-persistent.ps1、start-persistent.sh 支持 scheduled（
 
 原名称入口另支持 action=start/stop/restart/status，默认仍为 start；status/stop 无需模型凭据，restart 在确认实例退出后再调用原启动路径。共用的 Go 启停逻辑按项目和配置实例核对进程，先停守护再停审核，不删除基线或锁文件。可构建独立的 bin/start-persistent[.exe] 管理旧实例，避免覆盖运行中的审核二进制。完整命令、构建前提及原有指定 MR 参数见 [常驻审核一键启停](docs/persistent-control.md)。
 
-Linux 实时查看 infer：`watch -n 2 'bash ./start-persistent.sh gvs-infer --action status'`，GVS 将实例名换成 `gvs`。状态展示当前/最近尝试的仓库、任务、标题、阶段、运行中角色/审核包、开始时间、耗时、请求数、缓存命中与输入/输出/合计 token。`internal/progress` 在启动、任务开始/结束及每 15 秒输出日志并原子更新 `data/runtime/<配置名>.status.json`；管理工具仅展示 PID 匹配且一分钟内更新的状态。
+Linux 实时查看 infer：`watch -n 2 'bash ./start-persistent.sh gvs-infer --action status'`，GVS 将实例名换成 `gvs`。status 以表格展示当前审核及历史的审核对象（仓库 + MR 标题）、阶段、运行中的角色/包、开始时间、耗时与 Token（输入+输出）；当前无审核时只列历史（最近 10 条倒序），分支推送条目不记录不展示。`internal/progress` 在启动、任务开始/结束及每 15 秒输出日志并原子更新 `data/runtime/<配置名>.status.json`；管理工具仅展示 PID 匹配且一分钟内更新的状态。
 
 耗时覆盖整个审核尝试；token 是新请求已返回的供应商 usage，含知识、分析、角色、确认及备用模型调用，缓存命中不重复累计。等待中的请求尚无 usage，`usage_missing` 表示缺失可统计用量，显示值可能低于实际账单；它与预算预留值不同。新尝试从零计数，历史查日志。获得新字段需重建审核程序及独立管理工具（若使用），再重启实例；状态文件不作为审核成功基线。
 
@@ -545,7 +544,7 @@ go test -count=1 ./internal/understanding ./internal/packager ./internal/analyze
 
 费用应按每 PR 尝试的实际调用统计：知识更新（如发生）+ 各批变更分析及摘要归并 + 包×被分配角色的作业 + 各批最终确认 + 重试和主备请求。检查点命中的响应不新增 HTTP 调用、预算预留或本轮 Usage（用量），原始用量保留在缓存中；这是本地结果复用，不是供应商缓存折扣。实际账单还取决于输入/输出 Token（模型处理的文本单位，不能直接等同于字数）、供应商价格、订阅或配额机制。不能仅用“11 个角色各一次”估价。
 
-max_llm_calls、max_round_tokens、round_timeout 限制每 PR 实际尝试的调用、估算预留量和时长；max_round_cost>0 要求主备各模型价格。失败请求不退预留，估算不是精确 tokenizer 或账单。代码默认 100 次、1000000 预留、20m；GVS/infer 配置 600 次、12000000、60m，费用预算关闭。提高预算增加可完成工作，也扩大每 PR 潜在消耗。
+max_llm_calls、max_round_tokens、round_timeout 限制每 PR 实际尝试的调用、估算预留量和时长；max_round_cost>0 要求主备各模型价格。失败请求不退预留，估算不是精确 tokenizer 或账单。代码默认 100 次、1000000 预留、20m；GVS/infer 配置 3000 次、60000000、240m（支持大 MR），费用预算关闭，`llm.max_tokens` 为 0（不限输出长度）。提高预算增加可完成工作，也扩大每 PR 潜在消耗。
 
 评估建议：准备固定版本的小、中、大 diff 与专家标注，记录真实缺陷、误报、已知缺陷漏报、失败、截断、耗时和输入/输出 Token。比较单角色与多角色、理解开启与关闭，使用相同样本和人工判定口径。
 
@@ -617,7 +616,7 @@ max_llm_calls、max_round_tokens、round_timeout 限制每 PR 实际尝试的调
 
 **解决的问题**：多包多角色与重试会放大一次 PR 审核的调用。项目按每个实际尝试建立共享预算，各阶段及 HTTP 重试都在这个范围预留资源。
 
-**实际流程**：代码默认每 PR 尝试最多 100 次模型 HTTP 尝试、1000000 估算 Token、20m；GVS/infer 覆盖为 600 次、12000000、60m。主备与重试共享该预算，检查点命中不再预留；费用预算开启需主备价格。每扫描轮次最多运行一个实际流水线。
+**实际流程**：代码默认每 PR 尝试最多 100 次模型 HTTP 尝试、1000000 估算 Token、20m；GVS/infer 覆盖为 3000 次、60000000、240m（支持大 MR），输出长度不限（max_tokens=0）。主备与重试共享该预算，检查点命中不再预留；费用预算开启需主备价格。每扫描轮次最多运行一个实际流水线。
 
 **场景例子**：供应商连续返回可重试错误时，重试同样消耗调用预算，不会把每个角色的重试当成额外免费次数。网络错误无法证明供应商没有收费，所以失败预留不退还。
 
@@ -660,7 +659,7 @@ max_llm_calls、max_round_tokens、round_timeout 限制每 PR 实际尝试的调
 | understanding.document_path / codeup.state_path | 知识文档路径 / 已审版本基线路径 |
 | understanding.snapshot_repository / snapshot_repository | 首次初始化知识时读取源码对象的本地 Git 仓库路径 |
 | SOURCE-SHA / SOURCE-REPOSITORY | 知识来源提交 / 知识来源仓库；属于文档元数据，不是开关 |
-| max_files_per_review / max_diff_chars | 文件数上限 / 差异文本字节预算；chars 字面是字符，但实现按字节 |
+| max_diff_chars | 差异文本字节预算；chars 字面是字符，但实现按字节 |
 | review.checkpoint_dir / -checkpoint-dir | 响应/固定知识目录，默认 ./data/checkpoints；显式 CLI 空值关闭响应缓存 |
 | review.runtime_dir / AGENT_REVIEW_RUNTIME_DIR | 同机共享任务/执行锁/冷却/回执目录，默认 ./data/review-runtime；环境变量覆盖 |
 | max_issues_display | 详细展示问题数上限，不是发现数或确认数上限 |

@@ -4,7 +4,7 @@
 #   bash ./start-persistent.sh gvs --mode scheduled                     # 定时：仅 GVS
 #   bash ./start-persistent.sh gvs-infer                                # 定时：仅 infer
 #   bash ./start-persistent.sh gvs --mode manual --mr 123 --dry-run      # 手动：替换编号；移除 --dry-run 发布评论
-#   bash ./start-persistent.sh --action status                         # 检查全部实例：进程 + 审核表格（审核对象/阶段/角色包/开始时间/耗时/Token；当前无审核只列历史）
+#   bash ./start-persistent.sh --action status                         # 检查全部实例：进程 + 审核表格（审核对象/阶段/首次开始/最近结束/累计耗时/尝试/Token；同一对象版本未变时聚合多次尝试；当前无审核只列历史）
 #   bash ./start-persistent.sh gvs --action stop                        # 停止 GVS 守护与审核进程
 #   bash ./start-persistent.sh gvs-infer --action restart                # 重启 infer
 # 手动须选单个实例，并先停止对应守护进程和审核进程；只执行一次，返回审核退出码。

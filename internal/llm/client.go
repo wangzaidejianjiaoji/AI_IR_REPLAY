@@ -47,7 +47,8 @@ type chatRequest struct {
 // chatResponse OpenAI 兼容响应体。
 type chatResponse struct {
 	Choices []struct {
-		Message Message `json:"message"`
+		Message      Message `json:"message"`
+		FinishReason string  `json:"finish_reason"`
 	} `json:"choices"`
 	Usage struct {
 		PromptTokens     int `json:"prompt_tokens"`
@@ -69,11 +70,9 @@ type Usage struct {
 	Model            string
 }
 
-// New 创建 LLM 客户端。
+// New 创建 LLM 客户端。MaxTokens<=0 表示不限制输出长度（请求不携带 max_tokens，
+// 由供应商使用模型默认输出上限）。
 func New(cfg config.LLMConfig, logger *slog.Logger) *Client {
-	if cfg.MaxTokens <= 0 {
-		cfg.MaxTokens = 4000
-	}
 	if cfg.Retry.MaxAttempts <= 0 {
 		cfg.Retry.MaxAttempts = 3
 	}
@@ -262,6 +261,11 @@ func (c *Client) chatOnce(ctx context.Context, model string, messages []Message)
 			return "", Usage{}, false, quota
 		}
 		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
+		// 供应商并发请求上限（403 access_terminated_error）是瞬态拥挤，等待后重试即可，
+		// 不是账户额度问题，不应触发备用模型或直接判失败。
+		if resp.StatusCode == http.StatusForbidden && isConcurrentLimit(body) {
+			retryable = true
+		}
 		return "", Usage{}, retryable,
 			fmt.Errorf("llm status %d: %s", resp.StatusCode, truncate(string(body), 500))
 	}
@@ -290,7 +294,25 @@ func (c *Client) chatOnce(ctx context.Context, model string, messages []Message)
 		Provider:         c.cfg.Provider,
 		Model:            model,
 	}
-	return parsed.Choices[0].Message.Content, usage, false, nil
+	choice := parsed.Choices[0]
+	// 输出被截断时内容必然不完整，静默返回会让下游 JSON 解析
+	// 以 "unexpected end of JSON input" 失败；这里给出可定位的明确错误。
+	if strings.EqualFold(choice.FinishReason, "length") {
+		if c.cfg.MaxTokens > 0 {
+			return "", usage, true, fmt.Errorf("模型输出被 max_tokens=%d 截断（finish_reason=length）", c.cfg.MaxTokens)
+		}
+		return "", usage, true, fmt.Errorf("模型输出达到供应商输出上限被截断（finish_reason=length）")
+	}
+	if strings.TrimSpace(choice.Message.Content) == "" {
+		return "", usage, true, fmt.Errorf("llm 返回空内容（finish_reason=%s）", choice.FinishReason)
+	}
+	return choice.Message.Content, usage, false, nil
+}
+
+// isConcurrentLimit 识别供应商并发请求上限响应（如 kimi 403 access_terminated_error）。
+func isConcurrentLimit(body []byte) bool {
+	evidence := strings.ToLower(string(body))
+	return strings.Contains(evidence, "concurrent") && strings.Contains(evidence, "limit")
 }
 
 func (c *Client) redact(value string) string {

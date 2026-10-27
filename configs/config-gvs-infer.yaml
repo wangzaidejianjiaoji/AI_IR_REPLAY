@@ -1,6 +1,6 @@
 # config-gvs-infer.yaml — gvs_infer 仓库独立运行配置（C++17 CUDA 推理服务）
 # 绑定：规则文档 configs/review-rules-gvs-infer.yaml + 理解文档 docs/gvs-infer-code-understanding.md
-# 审查对象：Codeup lzvsg/gvs_infer 的分支推送与开启状态合并请求
+# 审查对象：Codeup lzvsg/gvs_infer 不在开发中的合并请求（UNDER_DEV/WIP 跳过）
 # 运行前注入环境变量：CODEUP_ORG_ID / CODEUP_TOKEN / KIMI_API_KEY
 # 用法：gvs-pr-agent -config configs/config-gvs-infer.yaml -once
 # 注意：与 config-gvs.yaml 相互独立（独立基线/服务端口/规则/理解文档），
@@ -34,6 +34,7 @@ codeup:
   per_page: 100
   state_path: "./data/gvs-infer-branch-state.json"  # gvs_infer 独立基线存储
   review_first_push: false
+  branch_review: false                              # 分支推送审查关闭：分支属开发中代码，仅审查不在开发中的 MR
   commit_comment: false
   mr_review: true
   mr_comment: true
@@ -50,7 +51,7 @@ llm:
     small: 500
     medium: 3000
   timeout: "600s"
-  max_tokens: 8000
+  max_tokens: 0                # 0 = 不限制输出长度（请求不携带 max_tokens），避免长输出 JSON 被截断
   temperature: 1
   retry:
     max_attempts: 3
@@ -84,14 +85,13 @@ review:
   # 与 GVS 共用执行锁、队列和账户冷却；结果按任务身份隔离。
   runtime_dir: "./data/review-runtime"
   checkpoint_dir: "./data/checkpoints"
-  max_llm_calls: 600
-  max_round_tokens: 12000000 # 保守输入/输出预留预算，不等于实际账单 Token
-  round_timeout: "60m"
+  max_llm_calls: 3000                       # 大 MR（数百文件）需要更多调用；轮次预算为成本上限，可按需调整
+  max_round_tokens: 60000000                # 保守输入/输出预留预算，不等于实际账单 Token
+  round_timeout: "240m"                     # 大 MR 串行+低并发下耗时较长，需放宽轮次时长
   max_round_cost: 0 # Set only with verified llm.prices in a single currency
   dry_run: false                           # 常驻运行发布 MR 评论；-dry-run 可临时禁止发布
   max_diff_chars: 120000
-  max_agent_concurrency: 4
-  max_files_per_review: 100                # 筛选后文件数上限；按文件数和文本预算分包，不抽样
+  max_agent_concurrency: 2                  # kimi 计划有账号级并发上限（403 concurrent limit），双实例共用账号时须压低并发
   file_packaging:
     enabled: true
     max_package_size: 5
