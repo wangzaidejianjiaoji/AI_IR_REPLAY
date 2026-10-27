@@ -99,8 +99,33 @@ GVS / infer 的 MR 以本地已成功审核的源 SHA、目标 SHA 为基线。�
 
 ## 本地验证
 
+### 项目健康度与每日审查
+
+新版审核程序在启动 `progress.Tracker` 时自动开启健康监控，复用原有 15 秒心跳和任务结束事件，无需额外运行命令、安装服务或配置 cron。因此 `bash ./start-persistent.sh` 启动后即持续记录，单实例、重启、手动审核和 PowerShell 启动同样生效；停止审核进程即停止采集。正常退出会写入停止标记，强制终止时页面以超过 60 秒的过期心跳提醒检查进程。该监控不替代供应商、代码托管平台的可用性检查。
+
+- 实时入口：`data/health/index.html`，本地浏览器打开，每 15 秒刷新。
+- 每日 HTML：`data/health/YYYY-MM-DD.html`，按北京时间分日；当日持续更新，跨日保留归档。进程运行且无审核时也会生成当日审查页。
+- 独立账本：`data/health/<实例>.json`，每日输入/输出/总 token、请求、usage 缺失、检查点命中、尝试/完成/中断、累计审核耗时、对象版本用量；不受原历史最多 100 条限制。账本含去重游标，重复心跳和结束发布不会重复计费，进程重启后的新尝试单独累计。
+- 每日审查：提示中断、同对象版本重复尝试、usage 缺失、无检查点命中、高输入占比、相对前日 token 增长及长耗时。展示高消耗对象、前日对比及部分问题未再出现的观察记录。启发式阈值在页面底部说明，需结合工作量和审核覆盖评估，不自动认定浪费或因果关系。
+
+“优化”目前是自动记录建议与指标变化，不会修改源码、模型、并发或预算；不额外调用模型。报告不保存提示词、源码、凭据，但保存仓库与审核标题。多个实例分别保存账本，共用报告锁；写入失败只记录警告、不阻断审核，损坏账本不会被静默重置。长期运行时账本与每日归档会增长，应按团队保留要求备份归档；不要在运行期间删除或手工修改账本。
+
+统计从启用新版程序后开始，不补录旧历史。计数是供应商返回的已知 usage，而非完整账单，不估算金额。尚未返回或缺失 usage 的请求及强制退出前最后一个心跳间隔可能低估消耗。跨午夜按观察到新增计数的北京时间日期入账，耗时按采样增量归属，不精确拆分午夜。程序未运行时不执行每日审查。
+
+已有二进制不会因源码更新自动重建。Linux 升级时先停止审核实例，再构建并启动（不要覆盖仍在执行的二进制）：
+
 ```bash
-go test -count=1 ./internal/lifecycle ./cmd/agent
+bash ./start-persistent.sh --action stop
+CGO_ENABLED=0 GOOS=linux go build -tags timetzdata -trimpath -o bin/gvs-pr-agent ./cmd/agent
+bash ./start-persistent.sh
+```
+
+Windows 用户需重新构建 `bin/gvs-pr-agent.exe` 后重启。HTML 报告由审核程序生成，不是启动脚本自行生成；缺少凭据或配置导致审核程序无法启动时，不会产生新的采集数据。
+
+### 验证命令
+
+```bash
+go test -count=1 ./internal/progress ./internal/llm ./internal/lifecycle ./cmd/agent
 bash tools/test-start-modes.sh
 # Linux 环境额外执行真实 flock/守护重启测试
 bash tools/test-persistent-linux.sh

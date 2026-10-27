@@ -239,7 +239,11 @@ func (t *Tracker) Publish() {
 		s.ElapsedSeconds = end.Sub(s.StartedAt).Seconds()
 	}
 	err := save(t.path, *s)
+	healthErr := t.publishHealth(*s, true)
 	if t.logger != nil {
+		if healthErr != nil {
+			t.logger.Warn("项目健康度记录失败", "error", healthErr)
+		}
 		if err != nil {
 			t.logger.Warn("保存运行状态失败", "error", err)
 		}
@@ -283,7 +287,21 @@ func (t *Tracker) Run(ctx context.Context, interval time.Duration) func() {
 			}
 		}
 	}()
-	return func() { cancel(); <-done; t.Publish() }
+	return func() {
+		cancel()
+		<-done
+		t.Publish()
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		if err := t.publishHealth(t.snapshot, false); err != nil && t.logger != nil {
+			t.logger.Warn("停止项目健康度记录失败", "error", err)
+		}
+	}
+}
+
+func (t *Tracker) publishHealth(s Snapshot, running bool) error {
+	name := strings.TrimSuffix(filepath.Base(t.path), ".status.json")
+	return recordHealth(healthDirectory(t.path), name, s, s.UpdatedAt, running)
 }
 
 // Print 以表格展示审核进度：仅当 pid 对应的存活审核进程正在审核时展示当前行，

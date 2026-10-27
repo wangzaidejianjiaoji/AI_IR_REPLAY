@@ -10,6 +10,7 @@
 # 手动须选单个实例，并先停止对应守护进程和审核进程；只执行一次，返回审核退出码。
 # 可选 --repo <配置内仓库全路径>、--checkpoint-dir <目录>；默认检查点 data/checkpoints/<实例>。
 # 定时模式后台运行，审核进程退出后 15 秒重启；日志在 data/runtime。
+# 新版审核程序自动生成 data/health/index.html，每 15 秒更新，每日审查归档（北京时间）。
 # 依赖 Bash、flock（util-linux），后台模式另需 nohup；缺少 bin/gvs-pr-agent 时用 Go 1.23+ 构建。
 # 凭据：export KIMI_API_KEY、CODEUP_TOKEN、CODEUP_ORG_ID，或放入外部 runtime-env.sh（chmod 600）。
 # 默认 ~/.config/AI_IR_REPLAY/runtime-env.sh；支持 XDG_CONFIG_HOME、AI_IR_RUNTIME_ENV。
@@ -129,3 +130,4 @@ for name in "${instances[@]}"; do
         exit 1
     fi
 done
+echo "Project health report: $root/data/health/index.html (requires an agent built from current source)."
